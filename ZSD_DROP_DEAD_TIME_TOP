@@ -1,0 +1,291 @@
+*&---------------------------------------------------------------------*
+*& Include ZSD_DROP_DEAD_TIME_TOP                            Report ZSD*
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT   zsd_drop_dead_time MESSAGE-ID zdptn.
+TYPE-POOLS: abap, slis.
+TYPES: BEGIN OF ty_lips,
+        vbeln TYPE likp-vbeln,
+        lddat TYPE likp-lddat,
+        kunnr TYPE likp-kunnr,
+        werks TYPE lips-werks,
+        ntgew TYPE lips-ntgew,
+        gewei TYPE lips-gewei,
+       END OF ty_lips,
+       BEGIN OF ty_vttp,
+        tknum TYPE vttp-tknum,
+        vbeln TYPE vttp-vbeln,
+        tdlnr TYPE vttk-tdlnr,
+        dptbg TYPE vttk-dptbg, " Planned date for start of shipment
+        uptbg TYPE vttk-uptbg, " Planned transport start time
+*---Begin of change TPSPNAI 08.09.2014 21:48:49
+        shtyp TYPE vttk-shtyp,
+*---End   of change TPSPNAI 08.09.2014 21:48:51
+       END OF ty_vttp,
+       BEGIN OF ty_vtts,
+        tknum   TYPE vtts-tknum,
+        tsnum   TYPE vtts-tsnum,
+        tsrfo   TYPE vtts-tsrfo,
+        vstel   TYPE vtts-vstel,
+        werka   TYPE vtts-werka,
+        kunna   TYPE vtts-kunna,
+*---Begin of change TPSPNAI 18.11.2015 15:58:47`
+        lifna   TYPE vtts-lifna,
+*---End of change TPSPNAI 18.11.2015 15:58:50
+        vstez   TYPE vtts-vstez,
+        werkz   TYPE vtts-werkz,
+        kunnz   TYPE vtts-kunnz,
+        lifnz   TYPE vtts-lifnz,
+        dpten   TYPE vtts-dpten,
+        upten   TYPE vtts-upten,
+        distz   TYPE vtts-distz,
+        medst   TYPE vtts-medst,
+        edland1 TYPE vtts-edland1,
+       END OF ty_vtts,
+       BEGIN OF ty_kna1,
+        kunnr       TYPE kna1-kunnr,
+        land1       TYPE kna1-land1,
+        name1       TYPE kna1-name1,
+        ort01       TYPE kna1-ort01,
+        pstlz       TYPE kna1-pstlz,
+        regio       TYPE kna1-regio,
+        time_zone   TYPE adrc-time_zone,
+       END OF ty_kna1,
+       BEGIN OF ty_lfa1,
+        lifnr       TYPE lfa1-lifnr,
+        name1       TYPE kna1-name1,
+       END OF ty_lfa1,
+       BEGIN OF ty_tvswz,
+        werks       TYPE tvswz-werks,
+        vstel       TYPE tvswz-vstel,
+        land1       TYPE kna1-land1,
+        name1       TYPE kna1-name1,
+        ort01       TYPE kna1-ort01,
+        pstlz       TYPE kna1-pstlz,
+        regio       TYPE kna1-regio,
+        time_zone   TYPE adrc-time_zone,
+       END OF ty_tvswz,
+       BEGIN OF ty_miler,
+        locno_from TYPE ztmpcmiler-locno_from,
+        locno_to   TYPE ztmpcmiler-locno_to,
+        distz      TYPE ztmpcmiler-distz,
+        medst      TYPE ztmpcmiler-medst,
+        durat      TYPE ztmpcmiler-durat,
+       END OF ty_miler,
+       BEGIN OF ty_214,
+        unix_key TYPE zedi214_stg-unix_key,
+        tknum    TYPE zedi214_stg-tknum,
+        tsnum    TYPE zedi214_stg-tsnum,
+        dpten    TYPE zedi214_stg-dpten,
+        upten    TYPE zedi214_stg-upten,
+        daten    TYPE zedi214_stg-daten,
+        uaten    TYPE zedi214_stg-uaten,
+        erdat    TYPE zedi214_stg-erdat,
+        erzet    TYPE zedi214_stg-erzet,
+       END OF ty_214,
+       BEGIN OF ty_final,
+         tknum   TYPE vtts-tknum,
+         tsrfo   TYPE vtts-tsrfo,
+         srcpt   TYPE vtts-kunnz,
+         srctx   TYPE t001w-name1,
+         srcct   TYPE t001w-ort01,
+         srcrg   TYPE t001w-regio,
+         srczp   TYPE char20,
+         srcln   TYPE t001w-land1,
+         srczn   TYPE adrc-time_zone,
+         dstpt   TYPE vtts-kunnz,
+         dsttx   TYPE kna1-name1,
+         dstct   TYPE kna1-ort01,
+         dstrg   TYPE kna1-regio,
+         dstzp   TYPE char20,
+         dstln   TYPE kna1-land1,
+         dstzn   TYPE adrc-time_zone,
+         dpten   TYPE vtts-dpten, " stage end date
+         upten   TYPE vtts-upten, " stage end time
+         enddt   TYPE char16,     " shipment end date and time
+         dptbg   TYPE vttk-dptbg, " Planned date for start of shipment
+         uptbg   TYPE vttk-uptbg, " Planned transport start time
+         ndddt   TYPE char16,     " New DDT date and time
+         ndat    TYPE vttk-dptbg, " new DDt date
+         ntim    TYPE vtts-upten, " new ddt time
+         distz   TYPE vtts-distz,
+         medst   TYPE vtts-medst,
+         lodwt   TYPE lips-ntgew, " load stage weight
+         uldwt   TYPE lips-ntgew, " unload stage weight
+         loddr   TYPE sy-uzeit,   " load duration
+         loddrs  TYPE i,          " loading duration in secs
+         ulddr   TYPE sy-uzeit,   " unload duration
+         ulddrs  TYPE i,          " unloading duration in secs
+         drvdr   TYPE sy-uzeit,   " Drive duration
+         drvdrs  TYPE i,          " Drive duration in secs
+         stgdr   TYPE sy-uzeit,   " Total Stage Duration
+         stgdrs  TYPE i,          " Total Stage Duration in secs
+         dbrks   TYPE i,          " Dot Breaks
+         brkdr   TYPE sy-uzeit,   " Break Durration
+         brkdrs  TYPE i,          " Break Durration in secs
+         totdr   TYPE sy-uzeit,   " Total Durration
+         totdrs  TYPE i,          " Total Durration
+         apdif   TYPE sy-uzeit,   " Appt Diff
+         apdifs  TYPE i,          " Appt Diff in secs
+         apdift  TYPE sy-uzeit,   " Appt diff time
+         apdifts TYPE i,          " Appt diff time in secs
+         cuddt   TYPE char16,     " Current DDT
+         edland1 TYPE vtts-edland1, " Destination Country
+         tdlnr   TYPE vttk-tdlnr,
+         name1   TYPE lfa1-name1,
+         stop    TYPE i,     " stop
+         splt    TYPE char1, " split
+         stsp    TYPE char5, "stop/split
+         aptdt   TYPE sy-datum, " appointment date
+         apttm   TYPE t, " appointment time
+         team    TYPE vttk-add04,
+*---Begin of change TPSPNAI 08.09.2014 21:53:18
+         shtyp   TYPE vttk-shtyp,
+*---End   of change TPSPNAI 08.09.2014 21:53:20
+       END OF ty_final,
+*---Begin of change TPSPNAI 25.08.2014 15:59:13
+       BEGIN OF ty_tknum,
+        tknum  TYPE vtts-tknum,
+        oplant TYPE zddt_default-oplant,
+        dplant TYPE zddt_default-dplant,
+        wadat  TYPE likp-wadat,
+       END OF ty_tknum.
+*---End of change TPSPNAI 25.08.2014 15:59:16
+
+CLASS: lcl_local DEFINITION DEFERRED,
+       lcl_event_handle DEFINITION DEFERRED.
+
+DATA: lv_werks    TYPE t001w-werks,
+      lv_shtyp    TYPE vttk-shtyp,
+      lv_miles    TYPE vtts-distz,
+      lv_tdlnr    TYPE vttk-tdlnr,
+      lv_soemail  TYPE ad_smtpadr,
+      lv_team     TYPE vttk-add04,
+
+      lt_lips     TYPE TABLE OF ty_lips,
+      lt_vtts     TYPE TABLE OF ty_vtts,
+      lt_214      TYPE TABLE OF ty_214,
+      lt_vttp     TYPE TABLE OF ty_vttp,
+      lt_kna1     TYPE TABLE OF ty_kna1,
+      lt_lfa1     TYPE TABLE OF ty_lfa1,
+      lt_tvswz    TYPE TABLE OF ty_tvswz,
+      lt_miler    TYPE TABLE OF ty_miler,
+      lt_hol      TYPE TABLE OF ztran_hol,          " Plant Holidays
+      lt_pwh      TYPE TABLE OF zplnt_whours,  " Plant Work Hours
+      lt_hdptn    TYPE TABLE OF zdptnplants,
+      ls_hdptn    TYPE          zdptnplants,
+      lt_bdc      TYPE TABLE OF bdcdata,
+      ls_bdc      TYPE          bdcdata,
+      lt_msg      TYPE TABLE OF bdcmsgcoll,
+      lt_final    TYPE TABLE OF ty_final,
+
+*---Begin of change TPSPNAI 25.08.2014 16:01:34
+      lt_ddt      TYPE TABLE OF zddt_default,
+      ls_ddt      TYPE zddt_default,
+      lt_tknum    TYPE TABLE OF ty_tknum,
+      ls_tknum1   TYPE ty_tknum,
+*---End of change TPSPNAI 25.08.2014 16:01:36
+
+      r_tknum     TYPE RANGE OF tknum,
+      r_tmail     TYPE RANGE OF tknum,
+
+      o_loc       TYPE REF TO lcl_local,
+      o_alv       TYPE REF TO cl_gui_alv_grid,
+      o_splt      TYPE REF TO cl_gui_splitter_container,
+      o_cont1     TYPE REF TO cl_gui_container,
+      o_cont2     TYPE REF TO cl_gui_container,
+      o_hand      TYPE REF TO lcl_event_handle,
+      lt_head     TYPE slis_t_listheader,
+      lt_fcat     TYPE lvc_t_fcat,
+      lt_fcatd    TYPE lvc_t_fcat,
+      lt_fcat_o   TYPE slis_t_fieldcat_alv,
+      ls_fcat_o   TYPE slis_fieldcat_alv,
+      ls_fcat     TYPE lvc_s_fcat,
+      ls_layo     TYPE lvc_s_layo,
+      ok_code     TYPE sy-ucomm,
+      save_ok     TYPE sy-ucomm,
+
+      ls_variant  TYPE disvariant,
+      lv_ret      TYPE i.
+
+FIELD-SYMBOLS: <fs_lips>  TYPE ty_lips,
+               <fs_vtts>  TYPE ty_vtts,
+               <fs_214>   TYPE ty_214,
+               <fs_vttp>  TYPE ty_vttp,
+               <fs_kna1>  TYPE ty_kna1,
+               <fs_lfa1>  TYPE ty_lfa1,
+               <fs_tvswz> TYPE ty_tvswz,
+               <fs_miler> TYPE ty_miler,
+               <fs_hol>   TYPE ztran_hol,
+               <fs_pwh>   TYPE zplnt_whours,
+               <fs_final> TYPE ty_final,
+*---Begin of change TPSPNAI 25.08.2014 16:02:29
+               <fs_ddt>   TYPE zddt_default,
+               <fs_tknum> TYPE ty_tknum.
+*---End of change TPSPNAI 25.08.2014 16:02:31
+
+
+*----selection screen design
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+
+SELECT-OPTIONS: s_plant FOR lv_werks,                " Plant
+                s_shtyp FOR lv_shtyp,                " Shipment type
+                s_sldat FOR sy-datum OBLIGATORY,     " Shipment Loading Date
+                s_miles FOR lv_miles.
+
+SELECTION-SCREEN SKIP 1.
+
+*---below two variables are used to calculate hours driven to the first break
+*---for the first satge of shipment
+PARAMETERS:     p_dtfo   TYPE sy-uzeit DEFAULT '070000',     " Drive Time From Origin
+                p_wtfo   TYPE sy-uzeit DEFAULT '080000',     " Work Time From Origin
+
+*---below two variables are used to calculate the hours driven after the
+*---first break for the first stage of the shipment. They will then be used
+*---to calculate breaks on the remaining shipment stages
+                p_mdt    TYPE sy-uzeit DEFAULT '100000',     " Max Drive Time
+                p_mwt    TYPE sy-uzeit DEFAULT '140000',     " Max work time
+
+                p_bt     TYPE sy-uzeit DEFAULT '100000',     " Break Time
+                p_pdt    TYPE sy-uzeit DEFAULT '010000',     " Plant Depart Time
+                p_dat    TYPE sy-uzeit DEFAULT '010000',     " Delivery Arrival Time
+
+*---below two variables will be used to calculate stop duration of a multi-
+*---pickup shipment. This calculated time will be added to the stage duration
+*---to calculate the depart time of the previous stop
+                p_alddr  TYPE sy-uzeit   DEFAULT '030000',  " Additional Loading Duration
+                p_lbphrl TYPE vtts-distz DEFAULT '15000',   " lbs per hour loading
+*---below two fields will be used to calculate the stop duration of a delivery
+*---location. This calculated time will be added to the stage duration to
+*---calculate the depart time of the previous stop
+                p_auddr  TYPE sy-uzeit   DEFAULT '003000',     " Add. Unloading Duration
+                p_lbphru TYPE vtts-distz DEFAULT '15000',      " lbs per hour Unloading
+
+                p_catrt  TYPE sy-uzeit DEFAULT '120000'.     " Canadian transit time
+*---this variable will be used to exclude shipments that have selected
+*---carriers assigned to them
+SELECT-OPTIONS: s_c2e    FOR  lv_tdlnr.     " Carriers to Exclude from DDT
+*---this variable will be used as the stage transit time in the event that
+*---the PCMILER transit time is 00:00
+PARAMETERS:     p_ztu    TYPE sy-uzeit DEFAULT '003000'.     " Zero Transit Use
+
+SELECTION-SCREEN SKIP 1.
+
+PARAMETERS: cb_et AS CHECKBOX DEFAULT abap_true,              " Exclude Team
+            cb_rb AS CHECKBOX,              " Run in Background
+*---if this box is checked it will trigger ZDPT to change the existing
+*---DDT based on changes to the above variables and/or the Customer
+*---Plant Bussiness Hour Table
+            cb_rddt AS CHECKBOX.            " Recalculate Existing DDT
+
+
+
+SELECTION-SCREEN END OF BLOCK b1.
+SELECTION-SCREEN BEGIN OF BLOCK b3 WITH FRAME TITLE text-003.
+PARAMETERS : p_vari TYPE disvariant-variant . " ALV variant
+SELECTION-SCREEN END OF BLOCK b3.
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-002.
+PARAMETERS: p_esend TYPE char1 AS CHECKBOX DEFAULT abap_false.
+SELECT-OPTIONS: s_email  FOR  lv_soemail NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK b2.
