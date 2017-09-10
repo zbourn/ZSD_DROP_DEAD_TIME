@@ -1,0 +1,2820 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSD_DROP_DEAD_TIME                                          *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+INCLUDE zsd_drop_dead_time_top                  .    " global Data
+INCLUDE: icons.
+
+* INCLUDE ZSD_DROP_DEAD_TIME_O01                  .  " PBO-Modules     *
+* INCLUDE ZSD_DROP_DEAD_TIME_I01                  .  " PAI-Modules     *
+* INCLUDE ZSD_DROP_DEAD_TIME_F01                  .  " FORM-Routines   *
+
+*CLASS lcl_event_handle DEFINITION DEFERRED.
+
+*----------------------------------------------------------------------*
+*       CLASS lcl_local DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_local DEFINITION.
+  PUBLIC SECTION.
+
+    METHODS: get_data RETURNING value(r_ret) TYPE i,
+             get_addnl_data RETURNING value(r_ret) TYPE i,
+             fill_final_table,
+             get_miler,
+             do_complex_calculation,
+             adjust_timezone IMPORTING date  TYPE sy-datum
+                                       time  TYPE sy-uzeit
+                                       szone TYPE adrc-time_zone
+                                       dzone TYPE adrc-time_zone
+                             EXPORTING rdate TYPE sy-datum
+                                       rtime TYPE sy-uzeit,
+             adjust_ddt IMPORTING tims TYPE i
+                                  date  TYPE sy-datum
+                                  time  TYPE sy-uzeit
+                        EXPORTING rdate TYPE sy-datum
+                                  rtime TYPE sy-uzeit,
+             add_to_ddt IMPORTING tims TYPE i
+                                  date  TYPE sy-datum
+                                  time  TYPE sy-uzeit
+                        EXPORTING rdate TYPE sy-datum
+                                  rtime TYPE sy-uzeit,
+             round_ddt CHANGING date  TYPE sy-datum
+                                time  TYPE sy-uzeit,
+             adjust_hol_working_hours CHANGING date  TYPE sy-datum
+                                               time  TYPE sy-uzeit
+                                               plant TYPE t001w-werks,
+             adjust_hol_working_hoursn CHANGING date  TYPE sy-datum " for next pickup
+                                               time  TYPE sy-uzeit
+                                               plant TYPE t001w-werks,
+             apptdiff IMPORTING d1 TYPE sy-datum
+                                d2 TYPE sy-datum
+                                t1 TYPE sy-uzeit
+                                t2 TYPE sy-uzeit
+                      RETURNING value(r_aptdif) TYPE i,
+             convert_time_to_mints IMPORTING tims TYPE sy-uzeit
+                                  RETURNING value(mints) TYPE i,
+            fill_bdc_data IMPORTING val1 TYPE char1
+                            val2 TYPE bdcdata-fnam
+                            val3 TYPE bdcdata-fval,
+            write_log IMPORTING lv_tknum TYPE vttk-tknum,
+            run_bdc_in_background,
+            display,
+            fill_fcat RETURNING value(rt_fcat) TYPE lvc_t_fcat,
+            add_column IMPORTING fname   TYPE char20
+                                 tname   TYPE char20
+                                 no_zero TYPE char1
+                                 hotspot TYPE char1
+                                 text    TYPE char50
+                                 colpos  TYPE i
+                                 dec     TYPE decimals OPTIONAL
+                                 sum     TYPE char1 OPTIONAL
+                                 reft    TYPE lvc_rfname OPTIONAL
+                                 reff    TYPE lvc_rtname OPTIONAL
+                                 out     TYPE lvc_outlen OPTIONAL
+                                 edit    TYPE char1 OPTIONAL
+                                 f4hp    TYPE char1 OPTIONAL
+                                 dtype   TYPE datatype_d OPTIONAL
+                                 itype   TYPE inttype OPTIONAL
+                       CHANGING rt_fcat TYPE lvc_t_fcat,
+
+            set_header,
+            get_header RETURNING value(rt_head) TYPE slis_t_listheader,
+            send_email,
+            fcat_adjest IMPORTING tabnam TYPE char30,
+            sto_shipments.
+ENDCLASS.                    "lcl_local DEFINITION
+*----------------------------------------------------------------------*
+*       CLASS lcl_local IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_local IMPLEMENTATION.
+  METHOD get_data.
+    DATA: lv_cnt    TYPE i,
+          lv_indx   TYPE i,
+          lt_lvttp  TYPE TABLE OF ty_vttp,
+          lt_dptn   TYPE TABLE OF zdptnplants,
+          rt_tknum  TYPE RANGE OF vttk-tknum,
+          ls_tknum  LIKE LINE OF rt_tknum.
+    REFRESH:  lt_lips,
+              lt_vtts,
+              lt_vttp,
+              lt_kna1,
+              lt_lfa1,
+              lt_tvswz,
+              lt_miler,
+              lt_final.
+    CLEAR: r_ret,
+           lv_team.
+*---exclude or include team driver
+    IF cb_et = abap_true.
+      lv_team = space.
+    ELSE.
+      lv_team = abap_true.
+    ENDIF.
+* Get Deliveries without Customer Pick ups.
+    SELECT a~vbeln
+           a~lddat
+           a~kunnr
+           b~werks
+           a~ntgew
+           a~gewei
+    FROM likp AS a INNER JOIN lips AS b
+    ON a~vbeln = b~vbeln
+    INTO TABLE lt_lips
+    WHERE a~lddat     IN s_sldat AND
+          a~wadat_ist = '00000000' AND
+          a~inco1 NOT IN ('EXW','OFC','TIS','ZPU') AND
+          b~werks IN s_plant.
+    IF sy-subrc EQ 0.
+      SORT: lt_lips BY vbeln.
+      DELETE ADJACENT DUPLICATES FROM lt_lips COMPARING vbeln.
+*--get the shipment by delivery
+      SELECT a~tknum
+             a~vbeln
+             b~tdlnr
+             b~dptbg
+             b~uptbg
+*---Begin of change TPSPNAI 08.09.2014 21:50:14
+             b~shtyp
+*---End   of change TPSPNAI 08.09.2014 21:50:17
+      FROM vttp AS a INNER JOIN vttk AS b
+      ON a~tknum = b~tknum
+      INTO TABLE lt_vttp
+      FOR ALL ENTRIES IN lt_lips
+      WHERE a~vbeln = lt_lips-vbeln AND
+            b~shtyp IN s_shtyp      AND
+            ( b~stdis = abap_true  OR b~streg = abap_true  OR b~stlbg = abap_true ) AND
+            ( b~stlad = abap_false OR b~stabf = abap_false OR b~sttbg = abap_false ) AND
+            b~add04 = lv_team. " for team driver
+      IF sy-subrc EQ 0.
+*---remove shipments by carroer exclude
+        IF s_c2e[] IS NOT INITIAL.
+          SORT: lt_vttp BY tdlnr.
+          DELETE lt_vttp WHERE tdlnr NOT IN s_c2e.
+          lv_cnt = LINES( lt_vttp ).
+          IF lv_cnt = 0.
+            r_ret = 1.
+            RETURN.
+          ENDIF.
+        ENDIF.
+*--filter shipments for which ZDPTN has already been run
+        IF cb_rddt = abap_false.
+          lt_lvttp = lt_vttp.
+          SORT: lt_lvttp BY tknum.
+          DELETE ADJACENT DUPLICATES FROM lt_lvttp COMPARING tknum.
+          IF lt_lvttp IS NOT INITIAL.
+            SELECT *
+            FROM zdptnplants
+            INTO TABLE lt_dptn
+            FOR ALL ENTRIES IN lt_lvttp
+            WHERE tknum = lt_lvttp-tknum.
+            IF sy-subrc EQ 0.
+              SORT: lt_dptn BY tknum.
+              LOOP AT lt_vttp ASSIGNING <fs_vttp>.
+                lv_indx = sy-tabix.
+                READ TABLE lt_dptn TRANSPORTING NO FIELDS WITH KEY tknum = <fs_vttp>-tknum BINARY SEARCH.
+                IF sy-subrc EQ 0.
+                  DELETE lt_vttp INDEX lv_indx.
+                ENDIF.
+              ENDLOOP.
+              lv_cnt = LINES( lt_vttp ).
+              IF lv_cnt = 0.
+                r_ret = 1.
+                RETURN.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        SORT: lt_vttp BY tknum.
+*---get carrier name
+        lt_lvttp = lt_vttp.
+        SORT: lt_lvttp BY tdlnr.
+        DELETE ADJACENT DUPLICATES FROM lt_lvttp COMPARING tdlnr.
+        SELECT lifnr
+               name1
+        FROM lfa1
+        INTO TABLE lt_lfa1
+        FOR ALL ENTRIES IN lt_lvttp
+        WHERE lifnr = lt_lvttp-tdlnr.
+        IF sy-subrc EQ 0.
+          SORT: lt_lfa1 BY lifnr.
+        ENDIF.
+*--get shipment stage data
+        lt_lvttp = lt_vttp.
+        SORT: lt_lvttp BY tknum.
+        DELETE ADJACENT DUPLICATES FROM lt_lvttp COMPARING tknum.
+        SELECT tknum
+               tsnum
+               tsrfo
+               vstel
+               werka
+               kunna
+*---Begin of change TPSPNAI 18.11.2015 15:59:41
+               lifna
+*---End of change TPSPNAI 18.11.2015 15:59:44
+               vstez
+               werkz
+               kunnz
+               lifnz
+               dpten
+               upten
+               distz
+               medst
+               edland1
+        FROM vtts
+        INTO TABLE lt_vtts
+        FOR ALL ENTRIES IN lt_lvttp
+        WHERE tknum = lt_lvttp-tknum.
+        IF sy-subrc EQ 0.
+          SORT: lt_vtts BY tknum tsrfo. "tsnum.
+*---filter shipments by their total miles
+          IF s_miles IS NOT INITIAL.
+            CLEAR: lv_miles.
+            LOOP AT lt_vtts ASSIGNING <fs_vtts>.
+              lv_miles = lv_miles + <fs_vtts>-distz.
+              AT END OF tknum.
+                IF lv_miles NOT IN s_miles.
+                  CLEAR: ls_tknum.
+                  ls_tknum-sign = 'I'.
+                  ls_tknum-option = 'EQ'.
+                  ls_tknum-low = <fs_vtts>-tknum.
+                  APPEND ls_tknum TO rt_tknum.
+                ENDIF.
+                CLEAR: lv_miles.
+              ENDAT.
+            ENDLOOP.
+            IF rt_tknum IS NOT INITIAL.
+              DELETE lt_vtts WHERE tknum IN rt_tknum.
+              SORT: lt_vtts BY tknum tsrfo. "tsnum.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+*---get 214
+        SELECT unix_key
+               tknum
+               tsnum
+               dpten
+               upten
+               daten
+               uaten
+               erdat
+               erzet
+        FROM zedi214_stg
+        INTO TABLE lt_214
+        FOR ALL ENTRIES IN lt_lvttp
+        WHERE tknum = lt_lvttp-tknum AND
+              tsnum = '0001'.
+        IF sy-subrc EQ 0.
+          SORT: lt_214 BY dpten.
+          DELETE lt_214 WHERE dpten = space.
+*---Use latest DDT from 214 and filter the duplicate
+          SORT: lt_214 BY tknum tsnum unix_key DESCENDING."erdat DESCENDING erzet DESCENDING.
+*          DELETE ADJACENT DUPLICATES FROM lt_214 COMPARING tknum tsnum erdat erzet.
+*          SORT: lt_214 BY tknum tsnum erdat DESCENDING erzet DESCENDING.
+        ENDIF.
+      ELSE.
+        r_ret = 1.
+        RETURN.
+      ENDIF.
+    ELSE.
+      r_ret = 1.
+    ENDIF.
+
+
+  ENDMETHOD.                    "get_data
+  METHOD get_addnl_data.
+    DATA: lt_lvtts TYPE TABLE OF ty_vtts.
+*---get plant for shipping point
+    SELECT a~werks
+           a~vstel
+           b~land1
+           b~name1
+           b~ort01
+           b~pstlz
+           b~regio
+           c~time_zone
+    FROM tvswz AS a INNER JOIN t001w AS b
+      ON a~werks = b~werks
+      LEFT OUTER JOIN adrc AS c
+      ON b~adrnr = c~addrnumber
+    INTO TABLE lt_tvswz.
+    IF sy-subrc EQ 0.
+      SORT: lt_tvswz BY vstel.
+    ENDIF.
+*---get source and destination deatils
+*---source plant
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY werka.
+    DELETE lt_lvtts WHERE werka IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING werka.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~kunnr AS werks
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+             b~time_zone
+      FROM t001w AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~werks = lt_lvtts-werka.
+    ENDIF.
+*--destination plant
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY werkz.
+    DELETE lt_lvtts WHERE werkz IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING werkz.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~kunnr AS werks
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+             b~time_zone
+      FROM t001w AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~werks = lt_lvtts-werkz.
+    ENDIF.
+*--source vendor
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY lifna.
+    DELETE lt_lvtts WHERE lifna IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING lifna.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~lifnr AS kunnr
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+             b~time_zone
+      FROM lfa1 AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~lifnr = lt_lvtts-lifna.
+    ENDIF.
+*--destination vendor
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY lifnz.
+    DELETE lt_lvtts WHERE lifnz IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING lifnz.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~lifnr AS kunnr
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+             b~time_zone
+      FROM lfa1 AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~lifnr = lt_lvtts-lifnz.
+    ENDIF.
+*--source customer
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY kunna.
+    DELETE lt_lvtts WHERE kunna IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING kunna.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~kunnr
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+             b~time_zone
+      FROM kna1 AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~kunnr = lt_lvtts-kunna.
+    ENDIF.
+*---destination customer
+    lt_lvtts = lt_vtts.
+    SORT: lt_lvtts BY kunnz.
+    DELETE lt_lvtts WHERE kunnz IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_lvtts COMPARING kunnz.
+    IF lt_lvtts IS NOT INITIAL.
+      SELECT a~kunnr
+             a~land1
+             a~name1
+             a~ort01
+             a~pstlz
+             a~regio
+*---Begin of change TPSPNAI 27.10.2015 20:51:01
+             b~time_zone
+*---End of change TPSPNAI 27.10.2015 20:51:04
+      FROM kna1 AS a LEFT OUTER JOIN adrc AS b
+        ON a~adrnr = b~addrnumber
+      APPENDING TABLE lt_kna1
+      FOR ALL ENTRIES IN lt_lvtts
+      WHERE a~kunnr = lt_lvtts-kunnz.
+    ENDIF.
+    SORT: lt_kna1 BY kunnr.
+    DELETE ADJACENT DUPLICATES FROM lt_kna1 COMPARING kunnr.
+*--get plant holidys
+    SELECT *
+    FROM zhol
+    INTO TABLE lt_hol.
+    IF sy-subrc EQ 0.
+      SORT: lt_hol BY plant_id datum.
+    ENDIF.
+*--get Plant Working Hours
+    SELECT *
+    FROM zplnt_whours
+    INTO TABLE lt_pwh.
+    IF sy-subrc EQ 0.
+      SORT: lt_pwh BY plant.
+    ENDIF.
+*---Begin of change TPSPNAI 25.08.2014 15:52:10
+*---identify STO shipments
+    me->sto_shipments( ).
+*---End of change TPSPNAI 25.08.2014 15:52:12
+    me->fill_final_table( ).
+  ENDMETHOD.                    "get_addnl_data
+  METHOD fill_final_table.
+    DATA: lv_kunnr TYPE kna1-kunnr,
+          lv_splt  TYPE char1,
+          lv_indx  TYPE sy-tabix,
+          lv_plnt  TYPE kna1-kunnr,
+          lv_werks TYPE t001w-werks,
+          lv_plntn TYPE t001w-werks,
+          ls_vtts  TYPE ty_vtts,
+          lv_count TYPE i,
+          lv_len   TYPE i.
+
+    LOOP AT lt_vtts ASSIGNING <fs_vtts>.
+
+*---split load logic
+      AT NEW tknum.
+        lv_count = 0.
+        lv_indx = sy-tabix + 1.
+        CLEAR: lv_plnt,
+               lv_plntn,
+               lv_splt.
+        READ TABLE lt_vtts INTO ls_vtts INDEX lv_indx.
+        IF sy-subrc EQ 0 AND ls_vtts-tknum = <fs_vtts>-tknum.
+          IF <fs_vtts>-vstel NE space.
+            READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstel BINARY SEARCH.
+            IF sy-subrc EQ 0.
+              lv_plnt = <fs_tvswz>-werks.
+            ENDIF.
+          ENDIF.
+          IF <fs_vtts>-werka NE space.
+            lv_plnt = <fs_vtts>-werka.
+          ENDIF.
+          IF ls_vtts-vstel NE space.
+            READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstel BINARY SEARCH.
+            IF sy-subrc EQ 0.
+              lv_plntn = <fs_tvswz>-werks.
+            ENDIF.
+          ENDIF.
+          IF ls_vtts-werka NE space.
+            lv_plntn = ls_vtts-werka.
+          ENDIF.
+          IF lv_plnt NE lv_plntn AND lv_plnt IS NOT INITIAL AND lv_plntn IS NOT INITIAL.
+            lv_splt = abap_true.
+          ENDIF.
+        ENDIF.
+
+      ENDAT.
+      lv_count = lv_count + 1.
+      AT END OF tknum.
+
+      ENDAT.
+      APPEND INITIAL LINE TO lt_final ASSIGNING <fs_final>.
+*---Begin of change TPSPNAI 08.09.2014 21:54:30
+*---fill Shiment type
+      READ TABLE lt_vttp ASSIGNING <fs_vttp> WITH KEY tknum = <fs_vtts>-tknum.
+      IF sy-subrc EQ 0.
+        <fs_final>-shtyp = <fs_vttp>-shtyp.
+      ENDIF.
+*---End   of change TPSPNAI 08.09.2014 21:54:33
+      <fs_final>-tknum = <fs_vtts>-tknum.
+      <fs_final>-tsrfo = <fs_vtts>-tsrfo.
+      <fs_final>-dpten = <fs_vtts>-dpten.
+      <fs_final>-upten = <fs_vtts>-upten.
+      CONCATENATE <fs_final>-dpten(4) '/' <fs_final>-dpten+4(2) '/' <fs_final>-dpten+6(2) '&'
+       <fs_final>-upten(2) ':' <fs_final>-upten+2(2) INTO <fs_final>-enddt.
+      TRANSLATE <fs_final>-enddt USING '& '.
+      <fs_final>-distz = <fs_vtts>-distz.
+      <fs_final>-medst = <fs_vtts>-medst.
+      <fs_final>-edland1 = <fs_vtts>-edland1.
+*---team
+      <fs_final>-team = lv_team.
+*---check if 214 done shipment
+      IF cb_rb = abap_true.
+        READ TABLE lt_214 ASSIGNING <fs_214> WITH KEY tknum = <fs_vtts>-tknum
+                                                          tsnum = <fs_vtts>-tsnum
+                                                          BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-aptdt = <fs_214>-dpten.
+          IF <fs_final>-aptdt IS INITIAL.
+            <fs_final>-aptdt = <fs_vtts>-dpten.
+          ENDIF.
+          <fs_final>-apttm = <fs_214>-upten(4).
+        ELSE.
+          <fs_final>-aptdt = <fs_vtts>-dpten.
+*---Do not set default time if not provided in 214 let it go as it is
+*          IF <fs_vtts>-upten IS INITIAL.
+*            <fs_final>-apttm = '0559'.
+*          ELSE.
+          <fs_final>-apttm = <fs_vtts>-upten(4).
+*          ENDIF.
+        ENDIF.
+      ELSE.
+        <fs_final>-aptdt = <fs_vtts>-dpten.
+        <fs_final>-apttm = <fs_vtts>-upten(4).
+      ENDIF.
+
+*---stop and splits
+      <fs_final>-splt = lv_splt.
+      <fs_final>-stop = lv_count.
+      <fs_final>-stsp = <fs_final>-stop.
+      CONDENSE <fs_final>-stsp NO-GAPS.
+      CONCATENATE <fs_final>-stsp <fs_final>-splt INTO <fs_final>-stsp SEPARATED BY space.
+*---fill carrier
+      READ TABLE lt_vttp ASSIGNING <fs_vttp> WITH KEY tknum = <fs_vtts>-tknum BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        <fs_final>-tdlnr = <fs_vttp>-tdlnr.
+        <fs_final>-dptbg = <fs_vttp>-dptbg.
+        <fs_final>-uptbg = <fs_vttp>-uptbg.
+        READ TABLE lt_lfa1 ASSIGNING <fs_lfa1> WITH KEY lifnr = <fs_vttp>-tdlnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-name1 = <fs_lfa1>-name1.
+        ENDIF.
+      ENDIF.
+*--source shipping point
+      IF <fs_vtts>-vstel NE space.
+        READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstel BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-srcpt = <fs_tvswz>-werks.
+          <fs_final>-srctx = <fs_tvswz>-name1.
+          <fs_final>-srcct = <fs_tvswz>-ort01.
+          <fs_final>-srcrg = <fs_tvswz>-regio.
+          <fs_final>-srczp = <fs_tvswz>-pstlz.
+          <fs_final>-srcln = <fs_tvswz>-land1.
+          <fs_final>-srczn = <fs_tvswz>-time_zone.
+        ENDIF.
+      ENDIF.
+*---source plant
+      IF <fs_vtts>-werka NE space.
+        lv_kunnr = <fs_vtts>-werka.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-srcpt = <fs_kna1>-kunnr.
+          <fs_final>-srctx = <fs_kna1>-name1.
+          <fs_final>-srcct = <fs_kna1>-ort01.
+          <fs_final>-srcrg = <fs_kna1>-regio.
+          <fs_final>-srczp = <fs_kna1>-pstlz.
+          <fs_final>-srcln = <fs_kna1>-land1.
+          <fs_final>-srczn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*---what about origin customer KUNNA
+      IF <fs_vtts>-kunna NE space.
+        lv_kunnr = <fs_vtts>-kunna.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-srcpt = <fs_kna1>-kunnr.
+          <fs_final>-srctx = <fs_kna1>-name1.
+          <fs_final>-srcct = <fs_kna1>-ort01.
+          <fs_final>-srcrg = <fs_kna1>-regio.
+          <fs_final>-srczp = <fs_kna1>-pstlz.
+          <fs_final>-srcln = <fs_kna1>-land1.
+          <fs_final>-srczn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*---Begin of change TPSPNAI 18.11.2015 16:05:03
+*--destination vendor
+      IF <fs_vtts>-lifna NE space.
+        lv_kunnr = <fs_vtts>-lifna.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-srcpt = <fs_kna1>-kunnr.
+          <fs_final>-srctx = <fs_kna1>-name1.
+          <fs_final>-srcct = <fs_kna1>-ort01.
+          <fs_final>-srcrg = <fs_kna1>-regio.
+          <fs_final>-srczp = <fs_kna1>-pstlz.
+          <fs_final>-srcln = <fs_kna1>-land1.
+          <fs_final>-srczn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*---End of change TPSPNAI 18.11.2015 16:05:05
+*---destination shipping point
+*--source shipping point
+      IF <fs_vtts>-vstez NE space.
+        READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstez BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-dstpt = <fs_tvswz>-werks.
+          <fs_final>-dsttx = <fs_tvswz>-name1.
+          <fs_final>-dstct = <fs_tvswz>-ort01.
+          <fs_final>-dstrg = <fs_tvswz>-regio.
+          <fs_final>-dstzp = <fs_tvswz>-pstlz.
+          <fs_final>-dstln = <fs_tvswz>-land1.
+          <fs_final>-dstzn = <fs_tvswz>-time_zone.
+        ENDIF.
+      ENDIF.
+
+*--destination plant
+      IF <fs_vtts>-werkz NE space.
+        lv_kunnr = <fs_vtts>-werkz.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-dstpt = <fs_kna1>-kunnr.
+          <fs_final>-dsttx = <fs_kna1>-name1.
+          <fs_final>-dstct = <fs_kna1>-ort01.
+          <fs_final>-dstrg = <fs_kna1>-regio.
+          <fs_final>-dstzp = <fs_kna1>-pstlz.
+          <fs_final>-dstln = <fs_kna1>-land1.
+          <fs_final>-dstzn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*---destination customer
+      IF <fs_vtts>-kunnz NE space.
+        lv_kunnr = <fs_vtts>-kunnz.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-dstpt = <fs_kna1>-kunnr.
+          <fs_final>-dsttx = <fs_kna1>-name1.
+          <fs_final>-dstct = <fs_kna1>-ort01.
+          <fs_final>-dstrg = <fs_kna1>-regio.
+          <fs_final>-dstzp = <fs_kna1>-pstlz.
+          <fs_final>-dstln = <fs_kna1>-land1.
+          <fs_final>-dstzn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*--destination vendor
+      IF <fs_vtts>-lifnz NE space.
+        lv_kunnr = <fs_vtts>-lifnz.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+
+        READ TABLE lt_kna1 ASSIGNING <fs_kna1> WITH KEY kunnr = lv_kunnr BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          <fs_final>-dstpt = <fs_kna1>-kunnr.
+          <fs_final>-dsttx = <fs_kna1>-name1.
+          <fs_final>-dstct = <fs_kna1>-ort01.
+          <fs_final>-dstrg = <fs_kna1>-regio.
+          <fs_final>-dstzp = <fs_kna1>-pstlz.
+          <fs_final>-dstln = <fs_kna1>-land1.
+          <fs_final>-dstzn = <fs_kna1>-time_zone.
+        ENDIF.
+      ENDIF.
+*---delivery loading and unloading weight
+      LOOP AT lt_vttp ASSIGNING <fs_vttp> WHERE tknum = <fs_vtts>-tknum.
+        READ TABLE lt_lips ASSIGNING <fs_lips> WITH KEY vbeln = <fs_vttp>-vbeln BINARY SEARCH.
+        IF sy-subrc EQ 0.
+*---loading weight
+          lv_kunnr = <fs_final>-srcpt.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = lv_kunnr
+            IMPORTING
+              output = lv_kunnr.
+          lv_len = STRLEN( lv_kunnr ).
+          CLEAR: lv_werks.
+          IF lv_len <= 4.
+            lv_werks = lv_kunnr(4).
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+              EXPORTING
+                input  = lv_werks
+              IMPORTING
+                output = lv_werks.
+          ENDIF.
+          IF <fs_lips>-werks = lv_werks AND lv_len <= 4.
+            <fs_final>-lodwt = <fs_final>-lodwt + <fs_lips>-ntgew.
+          ENDIF.
+*---unloading weight
+          IF <fs_lips>-kunnr = <fs_final>-dstpt.
+            <fs_final>-uldwt = <fs_final>-uldwt + <fs_lips>-ntgew.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+*---get drive duration
+    IF lt_final IS NOT INITIAL.
+      me->get_miler( ).
+      me->do_complex_calculation( ).
+    ENDIF.
+  ENDMETHOD.                    "fill_final_table
+  METHOD get_miler.
+    DATA: lt_lfinal TYPE TABLE OF ty_final.
+    lt_lfinal = lt_final.
+    SORT: lt_lfinal BY srczp dstzp.
+    DELETE ADJACENT DUPLICATES FROM lt_lfinal COMPARING srczp dstzp.
+    SELECT locno_from
+           locno_to
+           distz
+           medst
+           durat
+    FROM ztmpcmiler
+    INTO TABLE lt_miler
+    FOR ALL ENTRIES IN lt_lfinal
+    WHERE locno_from = lt_lfinal-srczp AND
+          locno_to   = lt_lfinal-dstzp.
+    IF sy-subrc EQ 0.
+      SORT: lt_miler BY locno_from locno_to.
+    ENDIF.
+
+  ENDMETHOD.                    "get_miler
+  METHOD display.
+    IF cb_rb = abap_true.
+      me->run_bdc_in_background( ).
+    ELSE.
+      CALL SCREEN 100.
+    ENDIF.
+
+  ENDMETHOD.                    "display
+  METHOD fill_fcat.
+    DATA: lv_count TYPE i.
+    REFRESH: rt_fcat,
+             lt_fcat_o.
+    CLEAR: lv_count.
+    lv_count = 1.
+*---Shipment No
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'TKNUM'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_true
+        text    = 'Shipment No'
+        colpos  = lv_count
+        reft    = 'VTTK'
+        reff    = 'TKNUM'
+        out     = 10
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Shipment No
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'NAME1'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Carrier Name'
+        colpos  = lv_count
+        reft    = 'LFA1'
+        reff    = 'NAME1'
+        out     = 40
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Source Point
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'SRCPT'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Source Point'
+        colpos  = lv_count
+        reft    = 'LFA1'
+        reff    = 'LIFNR'
+        out     = 10
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Stop
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'STOP'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Stop'
+        colpos  = lv_count
+        reft    = 'SYST'
+        reff    = 'SUBRC'
+        out     = 4
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Ship To Name
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'DSTTX'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Ship To Name'
+        colpos  = lv_count
+        reft    = 'KNA1'
+        reff    = 'KUNNR'
+        out     = 40
+      CHANGING
+        rt_fcat = rt_fcat.
+*---City
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'DSTCT'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'City'
+        colpos  = lv_count
+        reft    = 'KNA1'
+        reff    = 'ORT01'
+        out     = 35
+      CHANGING
+        rt_fcat = rt_fcat.
+*---State
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'DSTRG'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'State'
+        colpos  = lv_count
+        reft    = 'KNA1'
+        reff    = 'REGIO'
+        out     = 3
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Team
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'TEAM'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Team'
+        colpos  = lv_count
+        reft    = 'VTTK'
+        reff    = 'ADD04'
+        out     = 15
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Appt. Date
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'APTDT'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Appt. Date'
+        colpos  = lv_count
+        reft    = 'VTTS'
+        reff    = 'DPTEN'
+*        out     = 10
+        edit    = abap_true
+        f4hp    = abap_true
+        dtype   = 'DATS'
+        itype   = 'D'
+      CHANGING
+        rt_fcat = rt_fcat.
+*---Appt. Time
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'APTTM'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'Appt. Time'
+        colpos  = lv_count
+*        reft    = 'VTTS'
+*        reff    = 'UPTEN'
+        out     = 5
+        edit    = abap_true
+        f4hp    = abap_true
+        dtype   = 'TIMS'
+        itype   = 'T'
+      CHANGING
+        rt_fcat = rt_fcat.
+*---LoadbyDate
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'NDAT'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'LoadbyDate'
+        colpos  = lv_count
+        reft    = 'VTTS'
+        reff    = 'DPTEN'
+*        out     = 10
+        edit    = abap_false
+        f4hp    = abap_true
+        dtype   = 'DATS'
+        itype   = 'D'
+      CHANGING
+        rt_fcat = rt_fcat.
+*---LoadbyTime
+    lv_count = lv_count + 1.
+    CALL METHOD me->add_column
+      EXPORTING
+        fname   = 'NTIM'
+        tname   = 'LT_FINAL'
+        no_zero = abap_false
+        hotspot = abap_false
+        text    = 'LoadbyTime'
+        colpos  = lv_count
+        reft    = 'VTTS'
+        reff    = 'UPTEN'
+*        out     = 8
+        edit    = abap_false
+        f4hp    = abap_true
+        dtype   = 'TIMS'
+        itype   = 'T'
+      CHANGING
+        rt_fcat = rt_fcat.
+
+
+*---layout
+    ls_layo-cwidth_opt = abap_true.
+    ls_layo-zebra = abap_true.
+    ls_layo-sel_mode = 'D'.
+*---variant
+    CLEAR: ls_variant.
+    IF p_vari IS NOT INITIAL.
+      ls_variant-variant = p_vari.
+    ENDIF.
+    ls_variant-report = sy-cprog.
+  ENDMETHOD.                    "fill_fcat
+  METHOD set_header.
+    DATA : o_dd TYPE REF TO cl_dd_document,
+           table TYPE REF TO cl_dd_table_element,
+           a_logo TYPE REF TO cl_dd_area,
+           col_key TYPE REF TO cl_dd_area,
+           col_info TYPE REF TO cl_dd_area,
+           lv_text TYPE  sdydo_text_element,
+           lv_str(255)  TYPE c,
+           lv_indx TYPE i,
+           lv_max TYPE i,
+           lv_len TYPE i,
+           lv_gap TYPE i,
+           lv_count TYPE i.
+    FIELD-SYMBOLS: <fs_head> TYPE slis_listheader.
+
+    CLEAR: o_dd.
+    REFRESH: lt_head.
+*----get Header
+    lt_head = me->get_header( ).
+*---create Header
+    CREATE OBJECT o_dd.
+    LOOP AT lt_head ASSIGNING <fs_head>.
+      CLEAR: lv_text.
+      lv_indx = sy-tabix.
+      CALL METHOD o_dd->add_gap
+        EXPORTING
+          width = '1'.
+      IF lv_indx <= 2.
+        lv_text = <fs_head>-info.
+        CALL METHOD o_dd->add_text
+          EXPORTING
+            text          = lv_text
+            sap_style     = cl_dd_document=>heading
+            sap_color     = cl_dd_document=>strong
+            sap_fontstyle = cl_dd_document=>list_group_int
+            sap_emphasis  = cl_dd_document=>emphasis.
+
+        CALL METHOD o_dd->new_line.
+        IF lv_indx = 2.
+          CALL METHOD o_dd->new_line.
+        ENDIF.
+        CONTINUE.
+      ELSE.
+        IF lv_count = 0.
+          CALL METHOD o_dd->add_table
+            EXPORTING
+              no_of_columns = 2
+              with_heading  = ' '
+              border        = '0'
+            IMPORTING
+              table         = table.
+          CALL METHOD table->add_column
+            IMPORTING
+              column = col_key.
+          CALL METHOD table->add_column
+            IMPORTING
+              column = col_info.
+          lv_count = 1.
+        ENDIF.
+        lv_text = <fs_head>-key.
+        CALL METHOD col_key->add_text
+          EXPORTING
+            text         = lv_text
+            sap_emphasis = 'STRONG'.
+        CALL METHOD col_key->new_line.
+        CALL METHOD col_info->add_gap
+          EXPORTING
+            width = 6.
+        lv_text = <fs_head>-info.
+        CALL METHOD col_info->add_text
+          EXPORTING
+            text = lv_text.
+        CALL METHOD col_info->new_line.
+
+      ENDIF.
+    ENDLOOP.
+    CALL METHOD o_dd->merge_document.
+
+
+
+    CALL METHOD o_dd->set_document_background
+      EXPORTING
+        picture_id = 'ALV_BACKGROUND'.
+
+    CALL METHOD o_dd->display_document
+      EXPORTING
+        parent = o_cont1.
+  ENDMETHOD.                    "set_header
+  METHOD get_header.
+    DATA :lt_custom_header TYPE slis_t_listheader,
+          ls_custom_header TYPE slis_listheader,
+          lv_rpt_title    TYPE sy-title.
+
+    REFRESH: rt_head.
+
+    ls_custom_header-typ = 'D'.
+    ls_custom_header-key = 'P_ESEND'.
+    APPEND ls_custom_header TO lt_custom_header.
+
+    ls_custom_header-typ = 'D'.
+    ls_custom_header-key = 'S_EMAIL'.
+    APPEND ls_custom_header TO lt_custom_header.
+
+    lv_rpt_title = 'Departure Time Report'.
+
+    CALL FUNCTION 'ZTOP_OF_PAGE'
+      EXPORTING
+        i_title1        = lv_rpt_title
+        i_rpt_name      = sy-repid
+        i_custom_header = lt_custom_header
+        i_variant       = sy-slset
+      TABLES
+        it_header       = rt_head.
+  ENDMETHOD.                    "get_header
+  METHOD send_email.
+    DATA : lv_filename TYPE line.
+    DATA : lv_subj TYPE so_obj_des.
+    DATA : e_sent TYPE sy-subrc.
+    DATA : lv_attachtype(3) TYPE c.
+    DATA : it_content TYPE TABLE OF solisti1.
+    DATA : ls_con TYPE solisti1,
+           gv_rpt_title    TYPE sy-title.
+*---adjest fcat as per layout
+    me->fcat_adjest( 'LT_FINAL' ).
+    gv_rpt_title = 'Departure Time Report'.
+
+    ls_con-line = gv_rpt_title.
+    APPEND ls_con TO it_content.
+
+    lv_attachtype = 'XLS'.
+*subject
+    lv_subj = gv_rpt_title.
+    CONCATENATE lv_subj '-' sy-datum+4(2) '/' sy-datum+6(2) '/'
+                sy-datum+0(4) INTO lv_subj.
+*file name
+    CONCATENATE gv_rpt_title sy-datum+4(2) '/' sy-datum+6(2) '/'
+                sy-datum+0(4) INTO lv_filename.
+
+
+    CALL FUNCTION 'ZSEND_EMAIL_USING_SPOOL'
+      EXPORTING
+*        i_spool_no        = gv_spoolno
+        i_file_name       = lv_filename
+        i_subject_line    = lv_subj
+        i_attachtype      = lv_attachtype "'XLS'
+      IMPORTING
+        e_sent            = e_sent
+      TABLES
+*        it_receiver_email = s_email
+        it_body_content   = it_content
+*      it_receiver_fax   = s_faxno
+*        it_header         = lt_head
+*        it_fcat           = lt_fcat_o
+*        it_data           = lt_final
+.
+    IF e_sent = 0.
+      COMMIT WORK.
+    ENDIF.
+  ENDMETHOD.                    "send_email
+  METHOD fcat_adjest.
+    TYPE-POOLS kkblo.
+
+    DATA: et_fieldcat         TYPE kkblo_t_fieldcat,
+          ct_default_fieldcat TYPE kkblo_t_fieldcat,
+          cs_layout           TYPE kkblo_layout.
+
+    CHECK p_vari IS NOT INITIAL.
+
+    ls_variant-report = sy-repid.
+    ls_variant-variant = p_vari.
+
+*    temp_fieldcat[] = lt_fcat_o.
+
+* Transfer fcat from slis_t_fieldcat_alv to kkblo_t_fieldcat
+    CALL FUNCTION 'REUSE_ALV_TRANSFER_DATA'
+      EXPORTING
+        it_fieldcat = lt_fcat_o
+      IMPORTING
+        et_fieldcat = et_fieldcat.
+
+    ct_default_fieldcat[] = et_fieldcat[].
+
+    IF ls_variant-username IS INITIAL.
+      SELECT SINGLE username
+        FROM v_ltdx CLIENT SPECIFIED
+        INTO ls_variant-username
+        WHERE mandt     EQ sy-mandt AND
+              relid     EQ 'LT' AND
+              report    EQ ls_variant-report AND
+              handle    EQ ls_variant-handle AND
+              log_group EQ space AND
+              variant   EQ p_vari AND
+              type      EQ 'F'.
+    ENDIF.
+
+* Get no_out (hidden) fields in fcat
+    CALL FUNCTION 'LT_FC_LOAD'
+      EXPORTING
+        i_tool              = 'LT'
+        is_variant          = ls_variant
+        i_tabname           = tabnam
+      IMPORTING
+        et_fieldcat         = et_fieldcat
+      CHANGING
+        cs_layout           = cs_layout
+        ct_default_fieldcat = ct_default_fieldcat
+      EXCEPTIONS
+        fc_not_complete     = 1
+        OTHERS              = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* Transfer fcat from  kkblo_t_fieldcat to slis_t_fieldcat_alv
+    CALL FUNCTION 'REUSE_ALV_TRANSFER_DATA_BACK'
+      EXPORTING
+        it_fieldcat = et_fieldcat
+      IMPORTING
+        et_fieldcat = lt_fcat_o.
+  ENDMETHOD.                    "fcat_adjest
+  METHOD add_column.
+    CLEAR: ls_fcat,
+           ls_fcat_o.
+    ls_fcat-fieldname = fname.
+    ls_fcat-tabname = tname.
+    ls_fcat-no_zero = no_zero.
+    ls_fcat-hotspot = hotspot.
+    ls_fcat-seltext = text.
+    ls_fcat-scrtext_l = text.
+    ls_fcat-scrtext_m = text.
+    ls_fcat-scrtext_s = text.
+    IF dec IS NOT INITIAL.
+      ls_fcat-decimals = dec.
+    ENDIF.
+    IF out IS NOT INITIAL.
+      ls_fcat-outputlen = out.
+    ENDIF.
+    IF edit IS NOT INITIAL.
+      ls_fcat-edit = edit.
+    ENDIF.
+    IF f4hp IS NOT INITIAL.
+      ls_fcat-f4availabl = f4hp.
+    ENDIF.
+    IF dtype IS NOT INITIAL.
+      ls_fcat-datatype = dtype.
+    ENDIF.
+    IF itype IS NOT INITIAL.
+      ls_fcat-inttype = itype.
+    ENDIF.
+    IF reft IS NOT INITIAL.
+      ls_fcat-ref_table = reft.
+      ls_fcat-coltext   = text.
+    ENDIF.
+    IF reff IS NOT INITIAL.
+      ls_fcat-ref_field = reff.
+    ENDIF.
+    IF sum = abap_true.
+      ls_fcat-do_sum = sum.
+    ENDIF.
+    APPEND ls_fcat TO rt_fcat.
+
+    ls_fcat_o-fieldname = fname.
+    ls_fcat_o-tabname = tname.
+    ls_fcat_o-col_pos = colpos.
+    ls_fcat_o-seltext_l = text.
+    ls_fcat_o-seltext_m = text.
+    ls_fcat_o-seltext_s = text.
+    APPEND ls_fcat_o TO lt_fcat_o.
+  ENDMETHOD.                    "add_column
+  METHOD do_complex_calculation.
+    DATA: lv_indx   TYPE i,
+          lv_cindx  TYPE i, " current index
+          lv_pindx  TYPE i, " previous index
+          lv_tims   TYPE i,
+          lv_len    TYPE i,
+          lv_diff   TYPE int4,
+          lv_brk    TYPE int4,
+          lv_ndat   TYPE sy-datum,
+          lv_ntim   TYPE sy-uzeit,
+          lv_totdur TYPE i,        " total durration of shipment
+          lv_durat  TYPE i,
+          lv_findx  TYPE i,        " index of first stop
+          lv_nindx  TYPE i,        " Next record index
+          lv_prindx TYPE i,        " Previous record index
+          lv_aptdif TYPE int4,     "Appointment diffrence time in minutes
+          lv_trtim  TYPE int4,     "Transit time
+          lv_srcpt  TYPE char10,   " stop 1 source point
+          lv_srczn  TYPE adrc-time_zone, " source point time zone
+          lv_plant  TYPE char4,
+          lv_kunnr  TYPE char10,
+          lv_nbrk   TYPE p DECIMALS 2,
+          ls_tknum  LIKE LINE OF r_tknum,
+          ls_final  TYPE ty_final,
+          ls_pfinal TYPE ty_final,
+          lv_mstop  TYPE char1. "Multi Stop Indicator
+    REFRESH: r_tknum.
+    LOOP AT lt_final ASSIGNING <fs_final>.
+      lv_cindx = sy-tabix.
+      lv_indx = sy-tabix + 1.
+      <fs_final>-apttm+4(2) = '00'.
+      AT NEW tknum.
+        CLEAR: lv_totdur,
+               lv_srcpt,
+               lv_srczn,
+               lv_mstop,
+               lv_aptdif,
+               lv_brk.
+        lv_srcpt = <fs_final>-srcpt.
+        lv_srczn = <fs_final>-srczn.
+        lv_findx = lv_cindx.
+      ENDAT.
+*---get drive duration
+      READ TABLE lt_miler ASSIGNING <fs_miler> WITH KEY locno_from = <fs_final>-srczp
+                                                        locno_to   = <fs_final>-dstzp BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        <fs_final>-drvdr = <fs_miler>-durat.
+*---in minutes
+        <fs_final>-drvdrs = me->convert_time_to_mints( <fs_miler>-durat ).
+        IF <fs_final>-drvdrs = 0.
+          <fs_final>-drvdrs = 30. "Set default transit time
+          <fs_final>-drvdr = '003000'.
+        ENDIF.
+      ELSE.
+        CLEAR: ls_tknum.
+        ls_tknum-sign = 'I'.
+        ls_tknum-option = 'EQ'.
+        ls_tknum-low = <fs_final>-tknum.
+        APPEND ls_tknum TO r_tknum.
+        MESSAGE i001 WITH <fs_final>-tknum <fs_final>-srczp <fs_final>-dstzp.
+      ENDIF.
+*--do not concider loadingg time for first stop
+      IF <fs_final>-stop NE 1.
+        IF <fs_final>-lodwt NE 0. "Only if there is something to Load
+*--loading duration
+          <fs_final>-loddr = ( <fs_final>-lodwt / p_lbphrl ) + p_alddr.
+*---in minutes
+          <fs_final>-loddrs = ( ( <fs_final>-lodwt * 60 ) / p_lbphrl ) + ( me->convert_time_to_mints( p_alddr ) ).
+        ENDIF.
+      ENDIF.
+*---Do not Cocider Unloading Duration for last stop
+      READ TABLE lt_final INTO ls_final INDEX lv_indx.
+      IF sy-subrc EQ 0 AND ls_final-tknum = <fs_final>-tknum.
+        lv_mstop = abap_true.
+*--unloading duration
+        IF <fs_final>-uldwt NE 0. "Only is there is something to unload
+          <fs_final>-ulddr = ( <fs_final>-uldwt / p_lbphru ) + p_auddr.
+*--in minutes
+          <fs_final>-ulddrs = ( ( <fs_final>-uldwt * 60 ) / p_lbphru ) + ( me->convert_time_to_mints( p_auddr ) ).
+        ENDIF.
+      ENDIF.
+*--total stage duration
+      <fs_final>-stgdr = <fs_final>-drvdr + <fs_final>-loddr + <fs_final>-ulddr.
+*--in minutes
+      <fs_final>-stgdrs = <fs_final>-drvdrs + <fs_final>-loddrs + <fs_final>-ulddrs.
+      IF <fs_final>-lodwt NE 0. "Diffrent break calculation for pick stop
+*---Ist break Calculation
+*        IF <fs_final>-stgdrs > me->convert_time_to_mints( p_dtfo ).
+*        <fs_final>-dbrks = 1.
+*---Addition Break Calculation
+        CLEAR: lv_diff.
+*---Begin of change TPSPNAI 14.10.2015 19:08:45
+        lv_diff = <fs_final>-drvdrs - me->convert_time_to_mints( p_dtfo ).
+*      lv_diff = <fs_final>-stgdrs.
+*---End of change TPSPNAI 14.10.2015 19:08:50
+        IF lv_diff > 0.
+          TRY.
+              <fs_final>-dbrks = lv_diff DIV ( me->convert_time_to_mints( p_mdt ) ). "(Drive time - Drive Time from Origin) divided by maximum drive time
+            CATCH cx_sy_zerodivide.
+          ENDTRY.
+          <fs_final>-dbrks = <fs_final>-dbrks + 1.
+        ELSE.
+          <fs_final>-dbrks = 0.
+        ENDIF.
+*        ENDIF.
+      ELSE.
+        CLEAR: lv_diff.
+        lv_diff = <fs_final>-drvdrs.
+        TRY.
+            <fs_final>-dbrks = lv_diff DIV ( me->convert_time_to_mints( p_mdt ) ). "Drive time divided by maximum drive time
+          CATCH cx_sy_zerodivide.
+        ENDTRY.
+      ENDIF.
+*---Begin of change TPSPNAI 05.01.2016 15:52:23
+      lv_brk = lv_brk + <fs_final>-dbrks.
+*---End of change TPSPNAI 05.01.2016 15:52:26
+*      IF p_dtfo < <fs_final>-drvdr.
+*        TRY.
+*            <fs_final>-dbrks = <fs_final>-drvdr / p_dtfo.
+*          CATCH cx_sy_zerodivide.
+*        ENDTRY.
+*        IF <fs_final>-dbrks = 0.
+*          <fs_final>-dbrks = 1.
+*        ENDIF.
+*      ENDIF.
+      <fs_final>-brkdr = <fs_final>-dbrks * p_bt.
+*--break duration in minutes
+      <fs_final>-brkdrs = <fs_final>-dbrks * ( me->convert_time_to_mints( p_bt ) ).
+      IF <fs_final>-lodwt NE 0.
+*--total duration
+        <fs_final>-totdr = <fs_final>-stgdr + <fs_final>-brkdr + p_pdt + p_dat.
+*---PCMiler Duration+ loading duration +unloaidng duration + break duration+ Plant Depart Time + Delivery Arrival Time
+*--in minutes
+        <fs_final>-totdrs = <fs_final>-stgdrs + <fs_final>-brkdrs + ( me->convert_time_to_mints( p_pdt ) ) + ( me->convert_time_to_mints( p_dat ) ).
+      ELSE.
+*--total duration
+        <fs_final>-totdr = <fs_final>-stgdr + <fs_final>-brkdr + p_dat.
+*---PCMiler Duration+ loading duration +unloaidng duration + break duration
+*--in minutes
+        <fs_final>-totdrs = <fs_final>-stgdrs + <fs_final>-brkdrs + ( me->convert_time_to_mints( p_dat ) ).
+      ENDIF.
+*---appointment diffrence not for stage picking stops
+*      IF ( <fs_final>-stop NE 2 AND <fs_final>-splt = abap_false ) OR ( <fs_final>-stop NE 4 AND <fs_final>-splt = abap_true ).
+      CLEAR: lv_pindx.
+      lv_pindx = lv_cindx - 1.
+*--get previous stage appointment time
+      READ TABLE lt_final INTO ls_final INDEX lv_pindx.
+      IF sy-subrc EQ 0 AND ( <fs_final>-tknum = ls_final-tknum ) AND
+        ( <fs_final>-uldwt NE 0 AND ls_final-uldwt NE 0 ) "Appointment diffrence only between two drop stages
+        AND ls_final-aptdt IS NOT INITIAL AND <fs_final>-aptdt IS NOT INITIAL AND
+        ls_final-aptdt NE space AND <fs_final>-aptdt NE space.
+        <fs_final>-apdifs = me->apptdiff( d1 = ls_final-aptdt d2 = <fs_final>-aptdt t1 = ls_final-apttm  t2 = <fs_final>-apttm ).
+*--appt diff is more than break time
+        DATA: lv_bt   TYPE i,
+              lv_idol TYPE i.
+*---Begin of change TPSPNAI 14.10.2015 18:53:59
+*          lv_idol = <fs_final>-apdifs - <fs_final>-drvdrs.
+*        Added loading and unloading duration of previous stage as requested by Jason
+        lv_idol = <fs_final>-apdifs - ( <fs_final>-totdrs + ls_final-loddrs + ls_final-ulddrs ). " Use stage duration instead of drive duration
+        IF lv_idol < 0.
+          lv_idol = 0.
+        ENDIF.
+*---End of change TPSPNAI 14.10.2015 18:54:02
+        lv_bt = me->convert_time_to_mints( p_bt ).
+*          IF <fs_final>-apdifs > lv_bt.
+        IF <fs_final>-apdifs > <fs_final>-totdrs.
+*            <fs_final>-apdifts = <fs_final>-apdifs - lv_bt.
+*            <fs_final>-totdrs = <fs_final>-totdrs + <fs_final>-apdifts.
+          <fs_final>-totdrs = <fs_final>-totdrs + lv_idol.
+          lv_aptdif = lv_aptdif + lv_idol.
+        ENDIF.
+      ENDIF.
+*      ENDIF.
+      lv_totdur = lv_totdur + <fs_final>-totdrs.
+*---calculate load by time
+      AT END OF tknum.
+*--find new load by time
+        CLEAR: lv_ndat,
+               lv_ntim.
+*        lv_tims = lv_totdur(2) * 3600 + lv_totdur+2(2) * 60 + lv_totdur+4(2).
+*---Begin of change TPSPNAI 27.10.2015 21:02:59
+*---Add boarder time for cannada
+        IF <fs_final>-dstln = 'CA'.
+          lv_totdur = lv_totdur + me->convert_time_to_mints( p_catrt ).
+        ENDIF.
+*---End of change TPSPNAI 27.10.2015 21:03:02
+        "Add a break for mutilple stage, total break zero and total duration more than max work time
+        CLEAR: lv_trtim,
+               lv_durat.
+        lv_trtim = lv_totdur - lv_aptdif.
+        IF lv_mstop = abap_true AND lv_brk = 0." AND ( lv_totdur > me->convert_time_to_mints( p_mwt ) )." AND lv_aptdif < lv_trtim.
+          IF lv_aptdif < me->convert_time_to_mints( p_bt )."Total Idol time is less than Break Time Variable
+            lv_durat = lv_totdur. "Use Total deration which include Idol Time
+          ELSE.
+            lv_durat = lv_trtim. " Lest Use Total deration which exclude Idol Time
+          ENDIF.
+          IF lv_durat >= me->convert_time_to_mints( p_mwt ).
+            CLEAR: lv_nbrk.
+            lv_nbrk = lv_durat DIV me->convert_time_to_mints( p_wtfo ).
+            lv_nbrk = TRUNC( lv_nbrk ).
+            lv_totdur = lv_totdur +  ( lv_nbrk * me->convert_time_to_mints( p_bt ) ).
+          ENDIF.
+        ENDIF.
+        lv_tims = lv_totdur.
+*---reduce time
+        me->adjust_ddt( EXPORTING tims  = lv_tims date  = <fs_final>-aptdt time = <fs_final>-apttm
+                        IMPORTING rdate = lv_ndat rtime = lv_ntim ).
+*---round load by time to nearest half an hour.
+        me->round_ddt( CHANGING date = lv_ndat time = lv_ntim ).
+*--check if timezone not same ---Not Needed---They want it back
+        IF lv_srczn NE <fs_final>-dstzn AND lv_srczn IS NOT INITIAL AND <fs_final>-dstzn IS NOT INITIAL.
+          me->adjust_timezone( EXPORTING date  = lv_ndat time = lv_ntim szone = <fs_final>-dstzn dzone = lv_srczn
+                               IMPORTING rdate = lv_ndat rtime = lv_ntim ).
+        ENDIF.
+*--adjust holiday and plant working hours
+        CLEAR: lv_plant.
+        lv_kunnr = lv_srcpt.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = lv_kunnr
+          IMPORTING
+            output = lv_kunnr.
+        lv_len = STRLEN( lv_kunnr ).
+        IF lv_len <= 4.
+          lv_plant = lv_kunnr.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = lv_plant
+            IMPORTING
+              output = lv_plant.
+        ENDIF.
+
+        me->adjust_hol_working_hours( CHANGING date = lv_ndat time = lv_ntim plant = lv_plant ).
+*---Begin of change TPSPNAI 09.11.2015 10:53:05
+*--do not filter push shuttle shipment
+        READ TABLE lt_tknum TRANSPORTING NO FIELDS WITH KEY tknum = <fs_final>-tknum BINARY SEARCH.
+        IF sy-subrc NE 0.
+          IF <fs_final>-apttm IS INITIAL.
+            CLEAR: ls_tknum.
+            ls_tknum-sign = 'I'.
+            ls_tknum-option = 'EQ'.
+            ls_tknum-low = <fs_final>-tknum.
+            APPEND ls_tknum TO r_tknum.
+            MESSAGE i002 WITH <fs_final>-tknum.
+          ENDIF.
+        ENDIF.
+*----Set default 23:59:00 for 00:00:00 only when appointment is set for last satge
+        IF lv_ntim = '000000' AND <fs_final>-apttm IS NOT INITIAL.
+          lv_ntim = '235900'.
+          lv_ndat = lv_ndat - 1.
+        ENDIF.
+*----Set default 23:59:00 for 00:00:00 only when appointment is NOT set for last satge
+        IF lv_ntim = '000000' AND <fs_final>-apttm IS INITIAL.
+          lv_ntim = '235900'.
+          lv_ndat = lv_ndat - 1.
+        ENDIF.
+*---End   of change TPSPNAI 09.11.2015 10:53:08
+*--fill new DDT
+        CONCATENATE lv_ndat+4(2) '/' lv_ndat+6(2) '/' lv_ndat(4)  '&'  lv_ntim(2) ':' lv_ntim+2(2) INTO <fs_final>-ndddt.
+*--current DDT
+        <fs_final>-cuddt = <fs_final>-cuddt.
+*--new ddt
+        <fs_final>-ndat = lv_ndat.
+        <fs_final>-ntim = lv_ntim.
+*---update ddt to satge 1.
+        MODIFY lt_final FROM <fs_final> INDEX lv_findx TRANSPORTING ndat ntim.
+        IF <fs_final>-stop NE 1.
+          CLEAR: <fs_final>-ndat,
+                 <fs_final>-ntim.
+        ENDIF.
+*---for split load update ddt for additional picks
+        IF <fs_final>-stop NE 1 AND <fs_final>-splt = abap_true.
+          CLEAR: lv_nindx,
+                 lv_prindx.
+          lv_nindx =  lv_findx.
+          DO 4 TIMES.
+            lv_nindx =  lv_nindx + 1.
+            READ TABLE lt_final INTO ls_final INDEX lv_nindx.
+            IF sy-subrc EQ 0.
+*---if there is change in shipment exit
+              IF ls_final-tknum NE <fs_final>-tknum.
+                EXIT.
+              ENDIF.
+              CLEAR: ls_final-ndat,
+                     ls_final-ntim.
+*--check if its plant
+              lv_kunnr = ls_final-srcpt.
+              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+                EXPORTING
+                  input  = lv_kunnr
+                IMPORTING
+                  output = lv_kunnr.
+              lv_len = STRLEN( lv_kunnr ).
+              IF lv_len <= 4.
+*---get previous stage total duration
+                lv_prindx = lv_nindx - 1.
+                READ TABLE lt_final INTO ls_pfinal INDEX lv_prindx.
+                IF sy-subrc EQ 0.
+*--convert the total duration to seconds
+                  CLEAR: lv_tims.
+*                  lv_tims = ls_pfinal-totdr(2) * 3600 + ls_pfinal-totdr+2(2) * 60 + ls_pfinal-totdr+4(2).
+                  lv_tims = ls_pfinal-totdrs.
+*---add duration to previous DDT
+                  me->add_to_ddt( EXPORTING tims  = lv_tims date  = ls_pfinal-ndat time = ls_pfinal-ntim
+                                  IMPORTING rdate = ls_final-ndat rtime = ls_final-ntim ).
+*---round load by time to nearest half an hour.
+*                  me->round_ddt( CHANGING date = ls_final-ndat time = ls_final-ndat ).
+*--check if timezone not same
+                  IF ls_pfinal-srczn NE ls_final-dstzn AND ls_pfinal-srczn IS NOT INITIAL AND ls_final-dstzn IS NOT INITIAL.
+                    me->adjust_timezone( EXPORTING date  = ls_final-ndat time = ls_final-ntim szone = ls_pfinal-srczn dzone = ls_final-dstzn
+                                         IMPORTING rdate = ls_final-ndat rtime = ls_final-ntim ).
+                  ENDIF.
+*---st holiday and plant working hours
+                  lv_plant = lv_kunnr.
+                  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                    EXPORTING
+                      input  = lv_plant
+                    IMPORTING
+                      output = lv_plant.
+                  me->adjust_hol_working_hoursn( CHANGING date = ls_final-ndat time = ls_final-ntim plant = lv_plant ).
+                  MODIFY lt_final FROM ls_final INDEX lv_nindx TRANSPORTING ndat ntim.
+                ENDIF.
+              ELSE.
+                EXIT.
+              ENDIF.
+            ENDIF.
+          ENDDO.
+        ENDIF.
+      ENDAT.
+    ENDLOOP.
+*---Begin of change TPSPNAI 10.06.2014 02:03:33
+    IF r_tknum IS NOT INITIAL.
+      DELETE lt_final WHERE tknum IN r_tknum.
+    ENDIF.
+    IF r_tmail IS NOT INITIAL.
+      DELETE lt_final WHERE tknum IN r_tmail.
+      PERFORM send_email.
+    ENDIF.
+*---End   of change TPSPNAI 10.06.2014 02:03:35
+  ENDMETHOD.                    "do_complex_calculation
+  METHOD adjust_timezone.
+    DATA: lv_stamp TYPE tzonref-tstamps.
+    CALL FUNCTION 'ZIB_CONVERT_INTO_TIMESTAMP'
+      EXPORTING
+        i_datlo     = date
+        i_timlo     = time
+        i_tzone     = szone
+      IMPORTING
+        e_timestamp = lv_stamp.
+    IF sy-subrc EQ 0.
+
+      CALL FUNCTION 'ZIB_CONVERT_FROM_TIMESTAMP'
+        EXPORTING
+          i_timestamp = lv_stamp
+          i_tzone     = dzone
+        IMPORTING
+          e_datlo     = rdate
+          e_timlo     = rtime.
+
+    ELSE.
+      rdate = date.
+      rtime = time.
+    ENDIF.
+  ENDMETHOD.                    "adjust_timezone
+  METHOD adjust_ddt.
+    DATA: lv_date  TYPE sy-datum,
+          lv_time  TYPE sy-uzeit,
+          ls_tknum LIKE LINE OF r_tmail,
+          lv_tims  TYPE i.
+    lv_date = date.
+    lv_time = time.
+*---Begin of change TPSPNAI 27.04.2015 22:15:30
+    TRY.
+        lv_tims = tims * 60.
+      CATCH cx_sy_arithmetic_overflow.
+        CLEAR: ls_tknum.
+        ls_tknum-sign = 'I'.
+        ls_tknum-option = 'EQ'.
+        ls_tknum-low = <fs_final>-tknum.
+        COLLECT ls_tknum INTO r_tmail.
+        RETURN.
+    ENDTRY.
+*---End   of change TPSPNAI 27.04.2015 22:15:33
+    CALL FUNCTION 'START_TIME_DETERMINE'
+      EXPORTING
+         duration                         = lv_tims
+         unit                             = 'S'
+*        FACTORY_CALENDAR                 =
+      IMPORTING
+        start_date                       = rdate
+        start_time                       = rtime
+      CHANGING
+        end_date                         = lv_date
+        end_time                         = lv_time
+       EXCEPTIONS
+         factory_calendar_not_found       = 1
+         date_out_of_calendar_range       = 2
+         date_not_valid                   = 3
+         unit_conversion_error            = 4
+         si_unit_missing                  = 5
+         parameters_not_valid             = 6
+         OTHERS                           = 7
+                .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+  ENDMETHOD.                    "adjust_ddt
+  METHOD add_to_ddt.
+    DATA: lv_date  TYPE sy-datum,
+          lv_time  TYPE sy-uzeit,
+          ls_tknum LIKE LINE OF r_tmail,
+          lv_tims  TYPE i.
+    lv_date = date.
+    lv_time = time.
+*---Begin of change TPSPNAI 27.04.2015 22:33:16
+    TRY.
+        lv_tims = tims * 60.
+      CATCH cx_sy_arithmetic_overflow.
+        CLEAR: ls_tknum.
+        ls_tknum-sign = 'I'.
+        ls_tknum-option = 'EQ'.
+        ls_tknum-low = <fs_final>-tknum.
+        COLLECT ls_tknum INTO r_tmail.
+        RETURN.
+    ENDTRY.
+    CALL FUNCTION 'END_TIME_DETERMINE'
+     EXPORTING
+       duration                         = lv_tims
+       unit                             = 'S'
+*   FACTORY_CALENDAR                 =
+     IMPORTING
+       end_date                         = rdate
+       end_time                         = rtime
+     CHANGING
+       start_date                       = lv_date
+       start_time                       = lv_time
+     EXCEPTIONS
+       factory_calendar_not_found       = 1
+       date_out_of_calendar_range       = 2
+       date_not_valid                   = 3
+       unit_conversion_error            = 4
+       si_unit_missing                  = 5
+       parameters_no_valid              = 6
+       OTHERS                           = 7.
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+  ENDMETHOD.                    "add_to_ddt
+  METHOD round_ddt.
+    time+4(2) = 00.
+    IF time+2(2) > 30.
+      time+2(2) = '30'.
+    ELSEIF time+2(2) < 30.
+      time+2(2) = '00'.
+    ENDIF.
+  ENDMETHOD.                    "round_ddt
+  METHOD adjust_hol_working_hours.
+    DATA: lv_yes  TYPE char1.
+    IF plant IS NOT INITIAL.
+      READ TABLE lt_pwh ASSIGNING <fs_pwh> WITH KEY plant = plant BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        lv_yes  = abap_true.
+        IF time > <fs_pwh>-whend.
+          time = <fs_pwh>-whend.
+        ELSEIF time < <fs_pwh>-whstart.
+          date = date - 1.
+          time = <fs_pwh>-whend.
+        ENDIF.
+      ENDIF.
+      READ TABLE lt_hol ASSIGNING <fs_hol> WITH KEY plant_id = plant
+                                                    datum    = date BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        date = date - 1.
+        IF lv_yes  = abap_true.
+          time = <fs_pwh>-whend.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.                    "adjust_hol_working_hours
+  METHOD adjust_hol_working_hoursn.
+    DATA: lv_yes  TYPE char1.
+    IF plant IS NOT INITIAL.
+      READ TABLE lt_pwh ASSIGNING <fs_pwh> WITH KEY plant = plant BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        lv_yes  = abap_true.
+        IF time > <fs_pwh>-whend.
+          time = <fs_pwh>-whstart.
+          date = date + 1.
+        ELSEIF time < <fs_pwh>-whstart.
+          time = <fs_pwh>-whstart.
+        ENDIF.
+      ENDIF.
+      READ TABLE lt_hol ASSIGNING <fs_hol> WITH KEY plant_id = plant
+                                                    datum    = date BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        date = date + 1.
+        IF lv_yes  = abap_true.
+          time = <fs_pwh>-whstart.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.                    "adjust_hol_working_hoursn
+  METHOD apptdiff.
+    DATA: days     TYPE i,
+          tint     TYPE sy-uzeit,
+          seconds  TYPE i,
+          lv_secs  TYPE sytabix.
+
+*  IF D2 GE D1.
+*    IF d2 >= d1.
+*      days = d2 - d1.
+*      tint = t2 - t1.
+**--in minutes
+*      r_aptdif = ( ( days * 24 * 60 ) + ( tint(2) * 60 + tint+2(2) ) ).
+*    ENDIF.
+*    CALL FUNCTION 'CONVERSION_EXIT_SDURA_OUTPUT'
+*      EXPORTING
+*        input  = minutes
+*      IMPORTING
+*        output = r_aptdif.
+    CALL FUNCTION 'SWI_DURATION_DETERMINE'
+      EXPORTING
+        start_date = d1
+        end_date   = d2
+        start_time = t1
+        end_time   = t2
+      IMPORTING
+        duration   = lv_secs.
+    IF lv_secs > 0.
+      r_aptdif = lv_secs / 60.
+    ENDIF.
+  ENDMETHOD.                    "apptdiff
+  METHOD convert_time_to_mints.
+    DATA: lv_hrs  TYPE i,
+          lv_mins TYPE i,
+          lv_secs TYPE i.
+*          value(16)   TYPE p DECIMALS 0.
+    lv_hrs  = tims(2).
+    lv_mins = tims+2(2).
+    lv_secs = tims+4(2).
+    mints = lv_hrs * 60 + lv_mins.
+*    secs = value.
+  ENDMETHOD.                    "convert_time_to_mints
+  METHOD fill_bdc_data.
+    CLEAR: ls_bdc.
+    IF val1 = '1'.
+      ls_bdc-program  = val2.         " Program Name
+      ls_bdc-dynpro   = val3.         " Screen Number
+      ls_bdc-dynbegin = abap_true.          " Starting of new screen
+    ELSE.
+      ls_bdc-fnam = val2.             " Field Name
+      ls_bdc-fval = val3.             " Field Value
+    ENDIF.
+    APPEND ls_bdc TO lt_bdc.
+  ENDMETHOD.                    "fill_bdc_data
+  METHOD run_bdc_in_background.
+    DATA: lv_val3       TYPE bdcdata-fval,
+          lv_val2       TYPE bdcdata-fval,
+          lv_srcpt      TYPE kunnr,
+          lv_mode       TYPE char1 VALUE 'N',
+          flag_zdpt_exp TYPE char1 VALUE 'X',
+          lv_date       TYPE char10,
+          lv_dat        TYPE sy-datum,
+          lv_ndat       TYPE sy-datum,
+          lv_ntim       TYPE sy-uzeit,
+          lv_hdat       TYPE sy-datum,
+          lv_htim       TYPE sy-uzeit,
+          lv_stag       TYPE n,
+          lv_tknum      TYPE vttk-tknum.
+    REFRESH: lt_bdc,
+             lt_msg.
+*---remove those shipments for which appointment time is not supplied
+*--run BDC on VT02
+    LOOP AT lt_final ASSIGNING <fs_final>.
+      IF <fs_final>-aptdt IS INITIAL.
+        lv_tknum = <fs_final>-tknum.
+      ENDIF.
+      AT NEW tknum.
+        REFRESH: lt_bdc,
+                 lt_msg,
+                 lt_hdptn.
+        me->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMV56A' val3 = '0011' ).
+        lv_val3 = <fs_final>-tknum.
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-TKNUM' val3 = lv_val3 ).
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=UETP' ).
+        me->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMSSY0'   val3 = '0120' ).
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=TKAB' ).
+*---Begin of change TPSPNAI 25.08.2014 16:17:16
+*---check if valid for defalt ddt
+        CLEAR: ls_tknum1,
+               ls_ddt.
+        IF <fs_final>-shtyp NE 'ZZ10'. " Not for this shiment type
+          READ TABLE lt_tknum INTO ls_tknum1 WITH KEY tknum = <fs_final>-tknum BINARY SEARCH.
+          IF sy-subrc EQ 0.
+            READ TABLE lt_ddt INTO ls_ddt WITH KEY oplant = ls_tknum1-oplant dplant = ls_tknum1-dplant BINARY SEARCH.
+          ENDIF.
+        ENDIF.
+*---End of change TPSPNAI 25.08.2014 16:17:19
+      ENDAT.
+      CLEAR: lv_date,
+             lv_stag.
+      lv_stag = <fs_final>-tsrfo.
+      CONCATENATE <fs_final>-aptdt+4(2)
+                  <fs_final>-aptdt+6(2)
+                  <fs_final>-aptdt(4)
+                  INTO lv_date
+                  SEPARATED BY '/'.
+*--is this logic needed
+*IF it_shipment_change-tknum+(3) = '003'.
+*    IF it_shipment_change-tpvs  = 'X'.
+*      it_shipment_change-upten = '000000'.
+*    ENDIF.
+*  ENDIF.
+      CLEAR: lv_val2,
+             lv_val3.
+      CONCATENATE 'VTTS_ALL-DPTEN( ' lv_stag ' )' INTO lv_val2.
+      lv_val3 = lv_date.
+      me->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPLSTAG' val3 = '0300' ).
+      IF ls_ddt IS INITIAL. " change Nadim
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+      ELSE.
+*---Begin of change TPSPNAI 09.11.2015 12:08:08
+*---Supply the planned PGI date of any of the delivery in the shipment + transit days(for STO Shipments)
+        CLEAR: lv_dat,
+               lv_val3,
+               lv_date.
+        lv_dat = ls_tknum1-wadat + ls_ddt-tdays.
+        CONCATENATE lv_dat+4(2)
+                    lv_dat+6(2)
+                    lv_dat(4)
+                    INTO lv_date SEPARATED BY '/'.
+        lv_val3 = lv_date.
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---End   of change TPSPNAI 09.11.2015 12:08:11
+      ENDIF.
+      CLEAR: lv_val2,
+             lv_val3.
+      CONCATENATE 'VTTS_ALL-UPTEN( ' lv_stag ' )' INTO lv_val2.
+      IF ls_ddt IS INITIAL. " change Nadim
+        lv_val3 = <fs_final>-apttm.
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+      ELSE.
+        lv_val3 = ls_ddt-zddt. " change Nadim
+        o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ). " change Nadim
+      ENDIF.
+      me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=%ENT' ).
+      IF <fs_final>-stop EQ 1.
+*---save header ddt
+        CLEAR: lv_hdat,
+               lv_htim.
+        lv_hdat = <fs_final>-ndat.
+        lv_htim = <fs_final>-ntim.
+      ENDIF.
+*---update stage start date and time
+      IF <fs_final>-ndat IS NOT INITIAL.
+        CLEAR: lv_ndat,
+               lv_ntim.
+        lv_ndat = <fs_final>-ndat.
+        lv_ntim = <fs_final>-ntim.
+        CLEAR: lv_val2,
+               lv_val3,
+               ls_hdptn.
+*---Begin of change TPSPNAI 09.06.2014 20:58:27
+*---fill ZDPTN history table
+        ls_hdptn-tknum = <fs_final>-tknum.
+        CLEAR: lv_srcpt.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = <fs_final>-srcpt
+          IMPORTING
+            output = lv_srcpt.
+        ls_hdptn-werks = lv_srcpt.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = ls_hdptn-werks
+          IMPORTING
+            output = ls_hdptn-werks.
+
+        ls_hdptn-dptbg = lv_ndat.
+        ls_hdptn-uptbg = lv_ntim(4).
+        ls_hdptn-udate = sy-datum.
+        ls_hdptn-utime = sy-uzeit.
+        APPEND ls_hdptn TO lt_hdptn.
+*---End of change TPSPNAI 09.06.2014 20:58:31
+        CONCATENATE 'VTTS_ALL-DPTBG( ' lv_stag ' )' INTO lv_val2.
+        CLEAR: lv_date.
+        CONCATENATE lv_ndat+4(2)
+                    lv_ndat+6(2)
+                    lv_ndat(4)
+                    INTO lv_date
+                    SEPARATED BY '/'.
+        lv_val3 = lv_date.
+        me->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPLSTAG' val3 = '0300' ).
+        IF ls_ddt IS INITIAL. " change Nadim
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---Begin of change TPSPNAI 09.11.2015 12:18:43
+        ELSE.
+*---Supply the planned PGI date of any of the delivery in the shipment
+          CLEAR: lv_date.
+          CONCATENATE ls_tknum1-wadat+4(2)
+                    ls_tknum1-wadat+6(2)
+                    ls_tknum1-wadat(4)
+                    INTO lv_date SEPARATED BY '/'.
+          lv_val3 = lv_date.
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---End   of change TPSPNAI 09.11.2015 12:18:47
+        ENDIF.
+        CLEAR: lv_val2,
+               lv_val3.
+        lv_val3 = lv_ntim(4).
+        CONCATENATE 'VTTS_ALL-UPTBG( ' lv_stag ' )' INTO lv_val2.
+        IF ls_ddt IS INITIAL. " change Nadim
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+        ELSE.
+          lv_val3 = ls_ddt-zdddt.
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+        ENDIF.
+        me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=%ENT' ).
+      ENDIF.
+
+      AT END OF tknum.
+        IF lv_tknum NE <fs_final>-tknum.
+          CLEAR: lv_ndat,
+                 lv_ntim.
+          lv_ndat = lv_hdat.
+          lv_ntim = lv_htim.
+
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=TKAL' ).
+          me->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMV56A' val3 = '0020' ).
+          CLEAR: lv_date.
+          CONCATENATE lv_ndat+4(2)
+                      lv_ndat+6(2)
+                      lv_ndat(4)
+                      INTO lv_date
+                      SEPARATED BY '/'.
+          lv_val3 = lv_date.
+          IF ls_ddt IS INITIAL. " Change Nadim
+            me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTBG' val3 = lv_val3 ).
+*---Begin of change TPSPNAI 09.11.2015 15:01:34
+          ELSE.
+*---Supply the planned PGI date of any of the delivery in the shipment
+            CLEAR: lv_date.
+            CONCATENATE ls_tknum1-wadat+4(2)
+                    ls_tknum1-wadat+6(2)
+                    ls_tknum1-wadat(4)
+                    INTO lv_date SEPARATED BY '/'.
+            lv_val3 = lv_date.
+            me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTBG' val3 = lv_val3 ).
+*---End of change TPSPNAI 09.11.2015 15:01:36
+          ENDIF.
+          IF ls_ddt IS INITIAL. "change Nadim
+            lv_val3 = lv_ntim(4).
+            me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTBG' val3 = lv_val3 ).
+          ELSE.
+            lv_val3 = ls_ddt-zdddt(4). " Change Nadim
+            me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTBG' val3 = lv_val3 ). " Change Nadim
+          ENDIF.
+*--what about dpten upten of vttk---we populate it too finaly
+*---Begin of change TPSPNAI 10.12.2015 10:17:51
+          CLEAR: lv_date.
+          CONCATENATE <fs_final>-aptdt+4(2)
+                  <fs_final>-aptdt+6(2)
+                  <fs_final>-aptdt(4)
+                  INTO lv_date SEPARATED BY '/'.
+          lv_val3 = lv_date.
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTEN' val3 = lv_val3 ).
+          IF ls_ddt IS NOT INITIAL.
+            lv_val3 = ls_ddt-zdddt(4).
+          ELSE.
+            lv_val3 = <fs_final>-apttm(4). " Change Nadim
+          ENDIF.
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTEN' val3 = lv_val3 ). " Change Nadim
+*---End   of change TPSPNAI 10.12.2015 10:17:54
+          me->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=SICH' ).
+*---to be used in exit
+          EXPORT flag_zdpt_exp FROM flag_zdpt_exp TO MEMORY ID 'FLAG_ZDPT'.
+          CALL TRANSACTION 'VT02' USING lt_bdc
+                                 MODE lv_mode
+                                 UPDATE 'S'
+                                 MESSAGES INTO lt_msg.
+          me->write_log( <fs_final>-tknum ).
+        ENDIF.
+      ENDAT.
+*      AT LAST.
+*        LEAVE TO LIST-PROCESSING.
+*        LEAVE SCREEN.
+*      ENDAT.
+    ENDLOOP.
+  ENDMETHOD.                    "run_bdc_in_background
+  METHOD write_log.
+    DATA: lv_txt TYPE t100-text.
+    FIELD-SYMBOLS: <fs_msg> TYPE bdcmsgcoll.
+    FORMAT COLOR COL_HEADING.
+    WRITE :/ 'Shipment Logs',lv_tknum.
+    LOOP AT lt_msg ASSIGNING <fs_msg> WHERE msgnr NE '539'.
+
+      IF <fs_msg>-msgtyp = 'S'.
+
+        FORMAT COLOR COL_POSITIVE.
+
+        IF <fs_msg>-msgv1 NE space.
+          WRITE :/
+          'The Shipment',<fs_msg>-msgv1(10),'Updated Successfully.'.
+*---Begin of change TPSPNAI 09.06.2014 21:04:12
+          IF lt_hdptn IS NOT INITIAL.
+            READ TABLE lt_hdptn INTO ls_hdptn INDEX 1.
+            IF sy-subrc EQ 0.
+              DELETE FROM zdptnplants WHERE tknum = ls_hdptn-tknum.
+              IF sy-subrc EQ 0.
+                COMMIT WORK.
+              ENDIF.
+            ENDIF.
+            SORT: lt_hdptn.
+            DELETE ADJACENT DUPLICATES FROM lt_hdptn COMPARING ALL FIELDS.
+            MODIFY zdptnplants FROM TABLE lt_hdptn.
+            IF sy-subrc EQ 0.
+              COMMIT WORK.
+            ENDIF.
+          ENDIF.
+*---End of change TPSPNAI 09.06.2014 21:04:15
+        ELSE.
+          MESSAGE 'No Changes were made to Appoinment Date / Time.' TYPE 'S'.
+        ENDIF.
+
+      ELSEIF <fs_msg>-msgtyp = 'E'.
+
+        FORMAT COLOR COL_NEGATIVE.
+        CLEAR lv_txt.
+
+        SELECT SINGLE text
+        FROM t100
+        INTO lv_txt
+        WHERE sprsl = 'EN' AND
+              arbgb = <fs_msg>-msgid AND
+              msgnr = <fs_msg>-msgnr.
+        WRITE :/
+        'The Shipment',<fs_msg>-msgv1(10),'Terminated with an Error.',
+        lv_txt.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDMETHOD.                    "write_log
+  METHOD sto_shipments.
+    TYPES: BEGIN OF tt_vttp,
+               tknum TYPE vttp-tknum,
+               vbeln TYPE vttp-vbeln,
+               wadat TYPE likp-wadat,
+               kunnr TYPE likp-kunnr,
+             END OF tt_vttp.
+    DATA: lt_tmp     TYPE TABLE OF ty_vtts,
+          st_vttp    TYPE TABLE OF tt_vttp,
+          lv_skip TYPE char1,
+          lv_len  TYPE i.
+    FIELD-SYMBOLS: <sf_vttp> TYPE tt_vttp.
+    CLEAR: ls_tknum1.
+    REFRESH: lt_ddt,
+             lt_tknum.
+*--Get STO shipments
+    lt_tmp = lt_vtts.
+    SORT: lt_tmp BY tknum.
+    DELETE ADJACENT DUPLICATES FROM lt_tmp COMPARING tknum.
+    IF lt_tmp IS NOT INITIAL.
+*---Get Planned PGI Date
+      SELECT a~tknum
+             a~vbeln
+             b~wadat
+             b~kunnr
+      FROM vttp AS a INNER JOIN likp AS b
+        ON a~vbeln = b~vbeln
+      INTO TABLE st_vttp
+      FOR ALL ENTRIES IN lt_tmp
+        WHERE a~tknum = lt_tmp-tknum AND
+              b~lfart = 'ZMLN'. "Having STO in Shipment
+      IF sy-subrc EQ 0.
+*--Tame the digital Plants
+        LOOP AT st_vttp ASSIGNING <sf_vttp>.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = <sf_vttp>-kunnr
+            IMPORTING
+              output = <sf_vttp>-kunnr.
+          CLEAR: lv_werks.
+          lv_werks = <sf_vttp>-kunnr.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = lv_werks
+            IMPORTING
+              output = lv_werks.
+          <sf_vttp>-kunnr = lv_werks.
+        ENDLOOP.
+*---Begin of change TPSPNAI 23.12.2014 20:24:06
+*      SORT: lt_vttp BY tknum.
+        SORT: st_vttp BY tknum wadat.
+*---End of change TPSPNAI 23.12.2014 20:24:11
+      ENDIF.
+    ENDIF.
+    lt_tmp = lt_vtts.
+    SORT: lt_tmp BY tknum tsrfo.
+    LOOP AT lt_tmp ASSIGNING <fs_vtts>.
+      IF <fs_vtts>-tsrfo = '0001'.                          " stage 1
+        ls_tknum1-tknum = <fs_vtts>-tknum.
+        IF <fs_vtts>-werka IS NOT INITIAL.
+          ls_tknum1-oplant = <fs_vtts>-werka.
+        ELSEIF <fs_vtts>-vstel IS NOT INITIAL.
+          READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstel BINARY SEARCH.
+          IF sy-subrc EQ 0.
+            ls_tknum1-oplant = <fs_tvswz>-werks.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      IF lv_skip = space.
+        IF <fs_vtts>-kunnz IS NOT INITIAL.
+          IF <fs_vtts>-kunnz(6) = '000000' AND ls_tknum1-dplant IS INITIAL.
+*---check if it matches delivery shipment
+            READ TABLE st_vttp TRANSPORTING NO FIELDS WITH KEY tknum = <fs_vtts>-tknum kunnr = <fs_vtts>-kunnz+6(4).
+            IF sy-subrc EQ 0.
+              lv_skip = abap_true.
+              ls_tknum1-dplant = <fs_vtts>-kunnz+6(4).
+            ENDIF.
+          ENDIF.
+          lv_len = STRLEN( <fs_vtts>-kunnz ).
+          IF lv_len = 4 AND ls_tknum1-dplant IS INITIAL.
+*---check if it matches delivery shipment
+            READ TABLE st_vttp TRANSPORTING NO FIELDS WITH KEY tknum = <fs_vtts>-tknum kunnr = <fs_vtts>-kunnz(4).
+            IF sy-subrc EQ 0.
+              lv_skip = abap_true.
+              ls_tknum1-dplant = <fs_vtts>-kunnz(4).
+            ENDIF.
+          ENDIF.
+*---Begin of change TPSPNAI 17.09.2014 06:06:08
+        ELSEIF <fs_vtts>-werkz IS NOT INITIAL.
+*---check if it matches delivery shipment
+          READ TABLE st_vttp TRANSPORTING NO FIELDS WITH KEY tknum = <fs_vtts>-tknum kunnr = <fs_vtts>-werkz.
+          IF sy-subrc EQ 0.
+            lv_skip = abap_true.
+            ls_tknum1-dplant = <fs_vtts>-werkz.
+          ENDIF.
+        ELSEIF <fs_vtts>-vstez IS NOT INITIAL.
+          READ TABLE lt_tvswz ASSIGNING <fs_tvswz> WITH KEY vstel = <fs_vtts>-vstel BINARY SEARCH.
+          IF sy-subrc EQ 0.
+*---check if it matches delivery shipment
+            READ TABLE st_vttp TRANSPORTING NO FIELDS WITH KEY tknum = <fs_vtts>-tknum kunnr = <fs_tvswz>-werks.
+            IF sy-subrc EQ 0.
+              lv_skip = abap_true.
+              ls_tknum1-dplant = <fs_tvswz>-werks.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      AT END OF tknum.
+        IF ls_tknum1-oplant IS NOT INITIAL AND ls_tknum1-dplant IS NOT INITIAL.
+          READ TABLE st_vttp ASSIGNING <sf_vttp> WITH KEY tknum = ls_tknum1-tknum BINARY SEARCH.
+          IF sy-subrc EQ 0.
+            ls_tknum1-wadat = <sf_vttp>-wadat.
+            APPEND ls_tknum1 TO lt_tknum.
+          ENDIF.
+        ENDIF.
+        CLEAR: ls_tknum1,
+               lv_skip.
+      ENDAT.
+    ENDLOOP.
+    IF lt_tknum IS NOT INITIAL.
+      SORT: lt_tknum BY tknum.
+      SELECT *
+      FROM zddt_default
+      INTO TABLE lt_ddt.
+      IF sy-subrc EQ 0.
+        SORT: lt_ddt BY oplant dplant.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.                    "sto_shipments
+ENDCLASS.                    "lcl_local IMPLEMENTATION
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handle DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_event_handle DEFINITION.
+  PUBLIC SECTION.
+    METHODS: hot_click FOR EVENT hotspot_click OF cl_gui_alv_grid
+             IMPORTING
+             e_row_id
+             e_column_id
+             es_row_no
+             sender,
+             handle_toolbar
+        FOR EVENT toolbar OF cl_gui_alv_grid
+            IMPORTING e_object e_interactive,
+
+    handle_user_command
+        FOR EVENT user_command OF cl_gui_alv_grid
+            IMPORTING e_ucomm.
+ENDCLASS.                    "lcl_event_handle DEFINITION
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handle IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_event_handle IMPLEMENTATION.
+  METHOD hot_click.
+    DATA: lv_ret TYPE i,
+          ls_final TYPE ty_final.
+    CLEAR: ls_final.
+    READ TABLE lt_final INTO ls_final
+                      INDEX e_row_id-index.
+    IF sy-subrc EQ 0.
+      IF e_column_id = 'TKNUM'.
+        SET PARAMETER ID 'TNR' FIELD ls_final-tknum.
+        CALL TRANSACTION 'VT03N' AND SKIP FIRST SCREEN.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.                    "hot_click
+  METHOD handle_toolbar.
+    DATA: ls_toolbar  TYPE stb_button.
+* append a separator to normal toolbar
+    CLEAR ls_toolbar.
+    MOVE 3 TO ls_toolbar-butn_type.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+* append an icon
+    CLEAR ls_toolbar.
+    MOVE 'VT02' TO ls_toolbar-function.
+    MOVE icon_execute_object  TO ls_toolbar-icon.
+    MOVE 'Run VT02'(111) TO ls_toolbar-quickinfo.
+    MOVE 'Run VT02'(112) TO ls_toolbar-text.
+    MOVE ' ' TO ls_toolbar-disabled.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+*--disable unwanted edit buttons
+    LOOP AT e_object->mt_toolbar INTO ls_toolbar WHERE function CS 'LOCAL'.
+      ls_toolbar-disabled = abap_true.
+      MODIFY e_object->mt_toolbar FROM ls_toolbar TRANSPORTING disabled.
+    ENDLOOP.
+  ENDMETHOD.                    "handle_toolbar
+  METHOD handle_user_command.
+    DATA: lv_val3       TYPE bdcdata-fval,
+          lv_val2       TYPE bdcdata-fval,
+          lv_srcpt      TYPE kunnr,
+          lv_mode       TYPE char1 VALUE 'N',
+          flag_zdpt_exp TYPE char1 VALUE 'X',
+          lv_date       TYPE char10,
+          lv_dat        TYPE sy-datum,
+          lv_ndat       TYPE sy-datum,
+          lv_ntim       TYPE sy-uzeit,
+          lv_hdat       TYPE sy-datum,
+          lv_htim       TYPE sy-uzeit,
+          lv_stag       TYPE n,
+          lv_tknum      TYPE vttk-tknum,
+          lt_irows      TYPE lvc_t_row,
+          lt_nrow       TYPE lvc_t_roid,
+          r_tknum       TYPE RANGE OF vttk-tknum,
+          ls_tknum      LIKE LINE OF r_tknum.
+    FIELD-SYMBOLS: <fs_nrow> TYPE lvc_s_roid.
+    REFRESH: lt_bdc,
+             lt_msg.
+    IF e_ucomm = 'VT02'.
+*---get selected rows
+      o_alv->get_selected_rows( IMPORTING et_index_rows = lt_irows et_row_no = lt_nrow ).
+      IF lt_nrow IS INITIAL.
+        MESSAGE 'Please Select a row' TYPE 'S'.
+        RETURN.
+      ELSE.
+*--filter shipments
+        LOOP AT lt_nrow ASSIGNING <fs_nrow>.
+          READ TABLE lt_final ASSIGNING <fs_final> INDEX <fs_nrow>-row_id.
+          IF sy-subrc EQ 0.
+            CLEAR: ls_tknum.
+            ls_tknum-sign = 'I'.
+            ls_tknum-option  = 'EQ'.
+            ls_tknum-low = <fs_final>-tknum.
+            COLLECT ls_tknum INTO r_tknum.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+*---remove those shipments for which appointment time is not supplied
+*---do recalculation
+      o_loc->do_complex_calculation( ).
+*--run BDC on VT02
+      LOOP AT lt_final ASSIGNING <fs_final>.
+        IF <fs_final>-aptdt IS INITIAL.
+          lv_tknum = <fs_final>-tknum.
+        ENDIF.
+        IF <fs_final>-tknum NOT IN r_tknum.
+          lv_tknum = <fs_final>-tknum.
+        ENDIF.
+        AT NEW tknum.
+          REFRESH: lt_bdc,
+                   lt_msg,
+                   lt_hdptn.
+          o_loc->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMV56A' val3 = '0011' ).
+          lv_val3 = <fs_final>-tknum.
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-TKNUM' val3 = lv_val3 ).
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=UETP' ).
+          o_loc->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMSSY0'   val3 = '0120' ).
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=TKAB' ).
+*---Begin of change TPSPNAI 25.08.2014 16:17:16
+*---check if valid for defalt ddt
+          CLEAR: ls_tknum1,
+                 ls_ddt.
+          IF <fs_final>-shtyp NE 'ZZ10'. " Not for this shiment type
+            READ TABLE lt_tknum INTO ls_tknum1 WITH KEY tknum = <fs_final>-tknum BINARY SEARCH.
+            IF sy-subrc EQ 0.
+              READ TABLE lt_ddt INTO ls_ddt WITH KEY oplant = ls_tknum1-oplant dplant = ls_tknum1-dplant BINARY SEARCH.
+            ENDIF.
+          ENDIF.
+*---End of change TPSPNAI 25.08.2014 16:17:19
+        ENDAT.
+        CLEAR: lv_date,
+               lv_stag.
+        lv_stag = <fs_final>-tsrfo.
+        CONCATENATE <fs_final>-aptdt+4(2)
+                    <fs_final>-aptdt+6(2)
+                    <fs_final>-aptdt(4)
+                    INTO lv_date
+                    SEPARATED BY '/'.
+*--is this logic needed
+*IF it_shipment_change-tknum+(3) = '003'.
+*    IF it_shipment_change-tpvs  = 'X'.
+*      it_shipment_change-upten = '000000'.
+*    ENDIF.
+*  ENDIF.
+        CLEAR: lv_val2,
+               lv_val3.
+        CONCATENATE 'VTTS_ALL-DPTEN( ' lv_stag ' )' INTO lv_val2.
+        lv_val3 = lv_date.
+        o_loc->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPLSTAG' val3 = '0300' ).
+        IF ls_ddt IS INITIAL. " change Nadim
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+        ELSE.
+*---Begin of change TPSPNAI 09.11.2015 12:08:08
+*---Supply the planned PGI date of any of the delivery in the shipment + transit days(for STO Shipments)
+          CLEAR: lv_dat,
+                 lv_val3,
+                 lv_date.
+          lv_dat = ls_tknum1-wadat + ls_ddt-tdays.
+          CONCATENATE lv_dat+4(2)
+                      lv_dat+6(2)
+                      lv_dat(4)
+                      INTO lv_date SEPARATED BY '/'.
+          lv_val3 = lv_date.
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---End   of change TPSPNAI 09.11.2015 12:08:11
+        ENDIF.
+        CLEAR: lv_val2,
+               lv_val3.
+        CONCATENATE 'VTTS_ALL-UPTEN( ' lv_stag ' )' INTO lv_val2.
+        IF ls_ddt IS INITIAL. " change Nadim
+          lv_val3 = <fs_final>-apttm.
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+        ELSE.
+          lv_val3 = ls_ddt-zddt.
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+        ENDIF.
+        o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=%ENT' ).
+        IF <fs_final>-stop EQ 1.
+*---save header ddt
+          CLEAR: lv_hdat,
+                 lv_htim.
+          lv_hdat = <fs_final>-ndat.
+          lv_htim = <fs_final>-ntim.
+        ENDIF.
+*---update stage start date and time
+        IF <fs_final>-ndat IS NOT INITIAL.
+          CLEAR: lv_ndat,
+                 lv_ntim.
+          lv_ndat = <fs_final>-ndat.
+          lv_ntim = <fs_final>-ntim.
+          CLEAR: lv_val2,
+                 lv_val3,
+                 ls_hdptn.
+*---Begin of change TPSPNAI 09.06.2014 20:58:27
+*---fill ZDPTN history table
+          ls_hdptn-tknum = <fs_final>-tknum.
+          CLEAR: lv_srcpt.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = <fs_final>-srcpt
+            IMPORTING
+              output = lv_srcpt.
+          ls_hdptn-werks = lv_srcpt.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = ls_hdptn-werks
+            IMPORTING
+              output = ls_hdptn-werks.
+          ls_hdptn-dptbg = lv_ndat.
+          ls_hdptn-uptbg = lv_ntim(4).
+          ls_hdptn-udate = sy-datum.
+          ls_hdptn-utime = sy-uzeit.
+          APPEND ls_hdptn TO lt_hdptn.
+*---End of change TPSPNAI 09.06.2014 20:58:31
+
+          CONCATENATE 'VTTS_ALL-DPTBG( ' lv_stag ' )' INTO lv_val2.
+          CLEAR: lv_date.
+          CONCATENATE lv_ndat+4(2)
+                      lv_ndat+6(2)
+                      lv_ndat(4)
+                      INTO lv_date
+                      SEPARATED BY '/'.
+          lv_val3 = lv_date.
+          o_loc->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPLSTAG' val3 = '0300' ).
+          IF ls_ddt IS INITIAL. " change Nadim
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---Begin of change TPSPNAI 09.11.2015 12:18:43
+          ELSE.
+*---Supply the planned PGI date of any of the delivery in the shipment
+            CLEAR: lv_date.
+            CONCATENATE ls_tknum1-wadat+4(2)
+                      ls_tknum1-wadat+6(2)
+                      ls_tknum1-wadat(4)
+                      INTO lv_date SEPARATED BY '/'.
+            lv_val3 = lv_date.
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+*---End   of change TPSPNAI 09.11.2015 12:18:47
+          ENDIF.
+          CLEAR: lv_val2,
+                 lv_val3.
+          lv_val3 = lv_ntim(4).
+          CONCATENATE 'VTTS_ALL-UPTBG( ' lv_stag ' )' INTO lv_val2.
+          IF ls_ddt IS INITIAL. " change Nadim
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+          ELSE.
+            lv_val3 = ls_ddt-zdddt.
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 =  lv_val2   val3 = lv_val3 ).
+          ENDIF.
+          o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=%ENT' ).
+        ENDIF.
+
+        AT END OF tknum.
+          IF lv_tknum NE <fs_final>-tknum.
+            CLEAR: lv_ndat,
+                   lv_ntim.
+            lv_ndat = lv_hdat.
+            lv_ntim = lv_htim.
+
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=TKAL' ).
+            o_loc->fill_bdc_data( EXPORTING val1 = '1' val2 = 'SAPMV56A' val3 = '0020' ).
+            CLEAR: lv_date.
+            CONCATENATE lv_ndat+4(2)
+                        lv_ndat+6(2)
+                        lv_ndat(4)
+                        INTO lv_date
+                        SEPARATED BY '/'.
+            lv_val3 = lv_date.
+            IF ls_ddt IS INITIAL. " Change Nadim
+              o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTBG' val3 = lv_val3 ).
+*---Begin of change TPSPNAI 09.11.2015 15:01:34
+            ELSE.
+*---Supply the planned PGI date of any of the delivery in the shipment
+              CLEAR: lv_date.
+              CONCATENATE ls_tknum1-wadat+4(2)
+                      ls_tknum1-wadat+6(2)
+                      ls_tknum1-wadat(4)
+                      INTO lv_date SEPARATED BY '/'.
+              lv_val3 = lv_date.
+              o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTBG' val3 = lv_val3 ).
+*---End of change TPSPNAI 09.11.2015 15:01:36
+            ENDIF.
+            IF ls_ddt IS INITIAL. "change Nadim
+              lv_val3 = lv_ntim(4).
+              o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTBG' val3 = lv_val3 ).
+            ELSE.
+              lv_val3 = ls_ddt-zdddt(4). " Change Nadim
+              o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTBG' val3 = lv_val3 ). " Change Nadim
+            ENDIF.
+
+*--what about dpten upten of vttk---we populate it too finaly
+*---Begin of change TPSPNAI 10.12.2015 10:17:51
+            CLEAR: lv_date.
+            CONCATENATE <fs_final>-aptdt+4(2)
+                    <fs_final>-aptdt+6(2)
+                    <fs_final>-aptdt(4)
+                    INTO lv_date SEPARATED BY '/'.
+            lv_val3 = lv_date.
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-DPTEN' val3 = lv_val3 ).
+            IF ls_ddt IS NOT INITIAL.
+              lv_val3 = ls_ddt-zdddt(4).
+            ELSE.
+              lv_val3 = <fs_final>-apttm(4). " Change Nadim
+            ENDIF.
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'VTTK-UPTEN' val3 = lv_val3 ). " Change Nadim
+
+            o_loc->fill_bdc_data( EXPORTING val1 = ' ' val2 = 'BDC_OKCODE' val3 = '=SICH' ).
+*---to be used in exit
+            EXPORT flag_zdpt_exp FROM flag_zdpt_exp TO MEMORY ID 'FLAG_ZDPT'.
+            CALL TRANSACTION 'VT02' USING lt_bdc
+                                   MODE lv_mode
+                                   UPDATE 'S'
+                                   MESSAGES INTO lt_msg.
+            o_loc->write_log( <fs_final>-tknum ).
+          ENDIF.
+        ENDAT.
+        AT LAST.
+          LEAVE TO LIST-PROCESSING.
+          LEAVE SCREEN.
+        ENDAT.
+      ENDLOOP.
+    ENDIF.
+  ENDMETHOD.                    "handle_user_command
+ENDCLASS.                    "lcl_event_handle IMPLEMENTATION
+
+START-OF-SELECTION.
+  CLEAR: o_loc,
+           lv_ret.
+  CREATE OBJECT o_loc.
+*---get data
+  lv_ret = o_loc->get_data( ).
+  IF lv_ret = 1.
+    MESSAGE 'No Data found for given selection Parameters!' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+*---fill additional data
+  o_loc->get_addnl_data( ).
+  IF lt_final IS INITIAL.
+    MESSAGE 'No Data found for given selection Parameters!' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+*---display data
+  o_loc->display( ).
+*&---------------------------------------------------------------------*
+*&      Form  alv_display_variant
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_P_VARI  text
+*----------------------------------------------------------------------*
+FORM alv_display_variant  CHANGING p_variant TYPE disvariant-variant.
+
+  DATA: v_exit(1) TYPE c.
+  DATA: wa_variant TYPE disvariant.
+  DATA: v_save(1) TYPE c VALUE 'A'.
+
+  wa_variant-username = sy-uname.
+  wa_variant-report = sy-repid.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant                =  wa_variant
+*   I_TABNAME_HEADER          =
+*   I_TABNAME_ITEM            =
+*   IT_DEFAULT_FIELDCAT       =
+      i_save                    = v_save
+      i_display_via_grid        = 'X'
+    IMPORTING
+      e_exit                    = v_exit
+      es_variant                = wa_variant
+   EXCEPTIONS
+     not_found                 = 1
+     program_error             = 2
+     OTHERS                    = 3
+            .
+  IF v_exit = space.
+    p_variant = wa_variant-variant.
+  ENDIF.
+
+ENDFORM.                    " alv_display_variant
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_0100 OUTPUT.
+  DATA: o_doc TYPE REF TO cl_gui_docking_container,
+        o_back TYPE REF TO cl_gui_docking_container,
+        ls_print TYPE lvc_s_prnt,
+        lv_valid_for_spool_creation TYPE char1,
+        lv_valid TYPE char1.
+  SET PF-STATUS '100'.
+  SET TITLEBAR 'TIT'.
+**set heading
+*  o_loc->set_header( ).
+*---create field catalog
+  IF o_loc IS BOUND.
+    lt_fcat = o_loc->fill_fcat( ).
+  ENDIF.
+  IF cl_gui_alv_grid=>offline( ) IS INITIAL.
+    IF o_doc IS NOT BOUND.
+      CREATE OBJECT o_doc
+                 EXPORTING repid     = sy-repid
+                           dynnr     = sy-dynnr
+                           ratio     = '95'.
+      CALL METHOD o_doc->set_extension
+        EXPORTING
+          extension  = 99999
+        EXCEPTIONS
+          cntl_error = 1
+          OTHERS     = 2.
+      IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+      ENDIF.
+
+*---split container
+      CREATE OBJECT o_splt
+  EXPORTING parent  = o_doc
+  rows    = 2
+  columns = 1.
+** Upper Container
+      CALL METHOD o_splt->get_container
+        EXPORTING
+          row       = 1
+          column    = 1
+        RECEIVING
+          container = o_cont1.
+** Upper Container height
+      CALL METHOD o_splt->set_row_height
+        EXPORTING
+          id     = 1
+          height = 30.
+
+** Lower Container
+      CALL METHOD o_splt->get_container
+        EXPORTING
+          row       = 2
+          column    = 1
+        RECEIVING
+          container = o_cont2.
+      CREATE OBJECT o_alv
+        EXPORTING
+          i_parent          = o_cont2
+        EXCEPTIONS
+          error_cntl_create = 1
+          error_cntl_init   = 2
+          error_cntl_link   = 3
+          error_dp_create   = 4
+          OTHERS            = 5
+          .
+      IF sy-subrc <> 0.
+      ENDIF.
+      CREATE OBJECT o_hand.
+      SET HANDLER: o_hand->hot_click FOR o_alv,
+                   o_hand->handle_user_command FOR o_alv,
+                   o_hand->handle_toolbar FOR o_alv.
+    ENDIF.
+  ELSE.
+    IF o_back IS NOT BOUND.
+      CREATE OBJECT o_alv
+      EXPORTING
+        i_parent          = o_back
+      EXCEPTIONS
+        error_cntl_create = 1
+        error_cntl_init   = 2
+        error_cntl_link   = 3
+        error_dp_create   = 4
+        OTHERS            = 5
+        .
+      IF sy-subrc <> 0.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+*set heading
+  IF o_cont1 IS BOUND.
+    o_loc->set_header( ).
+  ENDIF.
+  IF p_esend = abap_true.
+    o_loc->send_email( ).
+  ENDIF.
+  IF cl_gui_alv_grid=>offline( ) IS INITIAL.
+    CALL METHOD o_alv->set_ready_for_input
+      EXPORTING
+        i_ready_for_input = 1.
+  ENDIF.
+*--display alv
+  CALL METHOD o_alv->set_table_for_first_display
+    EXPORTING
+      is_layout                     = ls_layo
+      i_save                        = 'A'
+      is_variant                    = ls_variant
+*      is_print                      = ls_print
+    CHANGING
+      it_outtab                     = lt_final
+      it_fieldcatalog               = lt_fcat
+*    IT_SORT                       =
+*    IT_FILTER                     =
+    EXCEPTIONS
+      invalid_parameter_combination = 1
+      program_error                 = 2
+      too_many_lines                = 3
+      OTHERS                        = 4
+          .
+  IF sy-subrc <> 0.
+
+  ENDIF.
+
+
+ENDMODULE.                 " STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  CLEAR: save_ok.
+  save_ok = ok_code.
+  CLEAR: ok_code.
+  IF save_ok = 'BACK' OR
+     save_ok = 'EXIT' OR
+     save_ok = 'CANC'.
+    SET SCREEN 0.
+  ENDIF.
+
+ENDMODULE.                 " USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*&      Form  send_email
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM send_email .
+  DATA: lv_type                TYPE so_obj_tp VALUE 'RAW', " body type,
+        lv_subject             TYPE so_obj_des,
+        lt_text                TYPE soli_tab,
+        ls_text                TYPE soli,
+        lv_attachment_type     TYPE soodk-objtp VALUE 'PDF',
+        lv_attachment_subject  TYPE sood-objdes,
+        lv_attachment_size     TYPE sood-objlen,
+        lt_recipents           TYPE zty_t_email,
+        ls_recipents           TYPE zty_s_email,
+        iv_subject             TYPE string,
+        ls_tmail               LIKE LINE OF r_tmail,
+        o_email                TYPE REF TO zcl_send_email.
+*--Get Email Addrss from TVARVC Variable
+  SELECT sign
+         opti
+         low
+         high
+  FROM tvarvc
+  INTO TABLE lt_recipents
+  WHERE name = 'ZDPTN_REPORT_ERROR' AND
+        type = 'S'.
+  IF sy-subrc EQ 0.
+    CLEAR: lv_subject.
+    CONCATENATE 'Plz find Shipments with issue' '.' INTO iv_subject.
+    lv_subject = iv_subject.
+    LOOP AT r_tmail INTO ls_tmail.
+      ls_text-line = ls_tmail-low.
+      APPEND ls_text TO lt_text.
+    ENDLOOP.
+    CREATE OBJECT o_email.
+    CALL METHOD o_email->send_email
+      EXPORTING
+        i_type               = lv_type
+        i_subject            = lv_subject
+        i_text               = lt_text
+        i_attachment_type    = lv_attachment_type
+        i_attachment_subject = lv_attachment_subject
+*      i_attachment_size    = lv_attachment_size
+*      i_att_content_hex    = i_content_bin
+*    I_ATT_CONTENT_TEXT   =
+        i_recipents          = lt_recipents
+*    I_SENDER             =
+        ip_subject           = iv_subject
+        .
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    " send_email
