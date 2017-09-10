@@ -1,0 +1,450 @@
+*----------------------------------------------------------------------*
+***INCLUDE LZHEADERF01 .
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_TITLE1  text
+*      -->P_I_RPT_NAME  text
+*      -->P_I_HEADER  text
+*----------------------------------------------------------------------*
+* TPSPPMP          | Add page numbers , net weight validation          *
+* 04/26/2011       | and removed leading zeros                         *
+* DV4K912924       |                                                   *
+* CHMN6751623      |                                                   *
+*----------------------------------------------------------------------*
+* TPSPS2P          | Added logic for fields of numeric data type       *
+* 06/21/2011       |                                                   *
+* DV4K913210       |                                                   *
+* CHMN6813336      |                                                   *
+*----------------------------------------------------------------------*
+FORM display  TABLES pt_header  TYPE slis_t_listheader
+              USING  p_title1   TYPE sy-title
+                     p_rpt_name TYPE sy-repid
+                     p_company  TYPE t001-bukrs
+                     p_custom_header TYPE slis_t_listheader
+                     p_variant TYPE sy-slset
+                     p_pagno TYPE sy-pagno.
+
+  DATA :  gc_text(30) TYPE c,  " Text for default value of variant
+          typ TYPE c VALUE 'S'," Variable for header type
+          lv_cuzeit(08) TYPE c, " Variable to hold value in time format
+          lv_butxt TYPE t001-butxt, " Variable to hold Company Code text
+          lv_company TYPE t001-bukrs," Variable to hold Company Code
+          slset TYPE sy-slset,    " variable to hold variant
+          wa_custom_header TYPE slis_listheader, " work area for header info
+          selection_table LIKE TABLE OF rsparams, " To hold selection criteria
+          wa_selection LIKE LINE OF selection_table, " Work Area to hold selection criteria
+          wa_header TYPE slis_listheader, " Work Area to hold top of page info
+          gc_key_displayed,  " holds 'X' if Key is already displayed for the given Sel.Opt.
+          gc_num_char TYPE i, " To get the length of header info
+          gc_temp_info(60). " To hold header info temporarily
+
+
+  DATA: it_textpool TYPE STANDARD TABLE OF textpool, " To hold texts of Sel Opt.,Parameters and text symbols
+        wa_textpool LIKE LINE OF it_textpool.  " Work area to hold texts of Sel Opt.,Parameters
+  " and text symbols
+  DATA : po_varnt TYPE sy-slset.
+  DATA : gc_len TYPE i.
+  DATA : gc_skip_flag,
+         gc_miss_text.
+  DATA :  gc_last_record_flag.
+
+  CLEAR pt_header[].
+*company Name
+  IF p_company IS INITIAL.
+    lv_company = 'FFI'.
+  ELSE.
+    lv_company = p_company.
+  ENDIF.
+* Get Company Code text
+  SELECT SINGLE butxt
+    FROM t001 INTO lv_butxt
+    WHERE bukrs EQ lv_company.
+
+  wa_header-typ  = 'H'.
+  wa_header-info =  lv_butxt.
+  APPEND wa_header TO pt_header.
+  CLEAR wa_header.
+** Title
+  wa_header-typ  = 'H'.
+  wa_header-info =  p_title1.
+  APPEND wa_header TO pt_header.
+  CLEAR wa_header.
+
+** Report Name
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Report: '.
+  wa_header-info =  p_rpt_name.
+  APPEND wa_header TO pt_header.
+  CLEAR wa_header.
+
+**   Date/Time
+  WRITE: sy-uzeit USING EDIT MASK '__:__:__' TO lv_cuzeit.
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Date-Time: '.
+  CONCATENATE  sy-datum+4(2) '/'
+               sy-datum+6(2) '/'
+               sy-datum(4) '-'
+               lv_cuzeit
+               INTO wa_header-info.   "Todays date
+  APPEND wa_header TO pt_header.
+  CLEAR wa_header.
+
+
+*user name
+  wa_header-typ  = 'S'.
+  wa_header-key  = 'Userid:'.
+  wa_header-info = sy-uname.
+  APPEND wa_header TO pt_header.
+  CLEAR : wa_header .
+
+*When we run the program in background from the selection screen by
+*selecting the menu option Program-> Execute in Background,
+*program doesn't carry the exact variant name, It will have value
+*like &000000000014(this the system generating incremental No).
+*In order to capture correct variant name, pass i_variant parameter.
+
+**Variant
+  wa_header-typ  = 'S'.
+  wa_header-key  = 'Variant : '.
+  IF p_variant IS NOT INITIAL.
+    wa_header-info = p_variant.
+  ELSE.
+    CLEAR gc_text.
+    slset = sy-slset.
+    IF slset IS INITIAL.
+      gc_text = 'Custom Selection'.
+    ELSE.
+      gc_text = slset.
+    ENDIF.
+    wa_header-info = gc_text.
+  ENDIF.
+  APPEND wa_header TO pt_header.
+  CLEAR : wa_header,gc_text.
+
+* Page  number
+  IF p_pagno IS NOT INITIAL.
+    wa_header-typ  = 'S'.
+    wa_header-key  = 'Page no:'.
+    wa_header-info = p_pagno.
+    CONDENSE wa_header-info.
+    APPEND wa_header TO pt_header.
+    CLEAR : wa_header .
+  ENDIF.
+
+
+* To get the Selection Criteria ( Sel Options / Parameters )
+* into the selection_table for the given report
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      curr_report     = p_rpt_name
+    TABLES
+      selection_table = selection_table.
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* to get text pool ( texts of Sel Opt.,Parameters and text symbols )
+* for the given report
+  READ TEXTPOOL p_rpt_name INTO it_textpool LANGUAGE sy-langu.
+
+
+  DATA: fname(100),  " to hold Report name and name of the selection criteria
+        f_type.       " to hold kind of Selection Criteria
+  FIELD-SYMBOLS: <fname> TYPE ANY.
+
+  SORT selection_table BY selname.
+  CLEAR : gc_miss_text,gc_skip_flag.
+
+  LOOP AT selection_table INTO wa_selection.
+
+    CLEAR : gc_len.
+    DESCRIBE TABLE pt_header LINES gc_len.
+    IF gc_len GE 15. "limit header to max 15 lines
+      EXIT.
+    ENDIF.
+
+* Clearing the flag gc_key_displayed for every new selection criteria
+
+    AT NEW selname.
+      CLEAR : gc_key_displayed , gc_skip_flag.
+    ENDAT.
+
+*
+    IF gc_skip_flag = 'X'.
+      CONTINUE.
+    ENDIF.
+
+*  Skip the iteration for the Sel Criteria
+*  for which type is 'D' set by the caller program
+    READ TABLE p_custom_header INTO wa_custom_header WITH KEY typ = 'D' key = wa_selection-selname.
+    IF sy-subrc EQ 0.
+      CONTINUE.
+    ENDIF.
+
+* Run the iteration only when there is some value in LOW ( or From )
+* field of selection criteria.
+    CHECK wa_selection-low IS NOT INITIAL.
+
+    MOVE typ TO wa_header-typ.
+
+
+    IF wa_selection-kind EQ 'P'.
+      CONCATENATE  '(' p_rpt_name ')' wa_selection-selname INTO fname.
+    ELSE.
+      CONCATENATE  '(' p_rpt_name ')' wa_selection-selname '-LOW' INTO fname.
+    ENDIF.
+
+    ASSIGN: (fname) TO <fname>.
+    DESCRIBE FIELD <fname> TYPE f_type.
+
+
+    CASE f_type .
+
+* If selection Criteria is of type 'D'
+* then get LOW and HIGH values in MM/DD/YYYY
+* format
+      WHEN 'D'. "date
+        IF wa_selection-low EQ '00000000'.
+          wa_selection-low = space.
+        ELSE.
+          CONCATENATE  wa_selection-low+4(2) '/'
+                       wa_selection-low+6(2) '/'
+                       wa_selection-low(4)
+                  INTO wa_selection-low.
+        ENDIF.
+
+        IF wa_selection-high EQ '00000000'.
+          wa_selection-high = space.
+        ELSE.
+          CONCATENATE  wa_selection-high+4(2) '/'
+                       wa_selection-high+6(2) '/'
+                       wa_selection-high(4)
+                  INTO wa_selection-high.
+        ENDIF.
+* If selection Criteria is of type 'P'
+* then get LOW and HIGH values as blank format for 0 values
+      WHEN 'P'. "
+        IF wa_selection-high EQ 0.
+          wa_selection-high = space.
+        ENDIF.
+        if wa_selection-high is initial.
+          IF wa_selection-low EQ 0.
+            wa_selection-low = space.
+          ENDIF.
+        endif.
+
+* If selection Criteria is of type 'T'
+* then get LOW and HIGH values ..:..:..
+* format
+      WHEN 'T'.
+        WRITE: wa_selection-low USING EDIT MASK '__:__:__' TO wa_selection-low.
+        WRITE: wa_selection-high USING EDIT MASK '__:__:__' TO wa_selection-high.
+      WHEN 'C'.
+        SHIFT wa_selection-low LEFT DELETING LEADING '0'.
+        SHIFT wa_selection-high LEFT DELETING LEADING '0'.
+      WHEN 'N'.
+        IF wa_selection-low EQ 0.
+          wa_selection-low = space.
+        ENDIF.
+
+        IF wa_selection-high EQ 0.
+          wa_selection-high = space.
+        ENDIF.
+        SHIFT wa_selection-low LEFT DELETING LEADING '0'.
+        SHIFT wa_selection-high LEFT DELETING LEADING '0'.
+      WHEN OTHERS.
+    ENDCASE.
+
+* Holding header info temporarily
+* It will be used when header info exceeds 60 characters i.e. maximum length
+    gc_temp_info = wa_header-info.
+    CLEAR : gc_last_record_flag.
+* get the info record according to restriction
+* mentioned in the selection criteria
+    PERFORM fill_header_info CHANGING wa_selection
+                               wa_header-info  .
+    CLEAR : gc_num_char.
+    gc_num_char = STRLEN( wa_header-info ).
+* maximum length of header info is 60 chars
+* if Header info exeeds 55 chars
+    IF gc_num_char >= 59.
+* Get the header data vaild upto 55 chars
+* already stored temporarily in gc_temp_info
+*      wa_header-info = gc_temp_info .
+      CONCATENATE gc_temp_info '*' INTO  wa_header-info.
+* Displaying key data ( name of the selction criteria )
+* If it is not already displayed for earlier lines
+      IF gc_key_displayed IS  INITIAL.
+        READ TABLE p_custom_header INTO wa_custom_header WITH KEY typ = 'S' key = wa_selection-selname.
+        IF sy-subrc EQ 0.
+          MOVE wa_custom_header-info TO wa_header-key.
+* Setting the flag if key is dispalyed for the specific selection criteria
+          gc_key_displayed = 'X'.
+        ELSE.
+          CLEAR wa_textpool.
+          READ TABLE it_textpool INTO wa_textpool WITH KEY id = 'S' key = wa_selection-selname.
+
+          IF wa_textpool-entry(1) = 'D'.
+            wa_textpool-entry(1) = space.
+          ENDIF.
+
+          CONDENSE wa_textpool-entry.
+          MOVE wa_textpool-entry TO wa_header-key.
+* Setting the flag if key is displayed for the specific selection criteria
+          gc_key_displayed = 'X'.
+        ENDIF.
+      ENDIF.
+* Adding the valid part of Header info
+      APPEND wa_header TO pt_header.
+      gc_skip_flag = 'X'.  " This flag will be used to skip multiple lines of the current Select Options.
+      gc_miss_text = 'X'.  " To add theb last line of missing text if any exist.
+
+      CLEAR wa_header.
+      MOVE typ TO wa_header-typ.
+    ENDIF.
+
+    IF gc_skip_flag IS INITIAL.
+* At the end of sel criteria
+      AT END OF selname.
+
+* Setting the flag gc_last_record_flag
+* which showas that this is the last record for
+* given sel criteria in the selection table
+        gc_last_record_flag = 'X'.
+* Displaying key data ( name of the selction criteria )
+* If it is not already displayed for earlier lines
+        IF gc_key_displayed IS INITIAL.
+          READ TABLE p_custom_header INTO wa_custom_header WITH KEY typ = 'S' key = wa_selection-selname.
+          IF sy-subrc EQ 0.
+            MOVE wa_custom_header-info TO wa_header-key.
+* Setting the flag if key is displayed for the specific selection criteria
+            gc_key_displayed = 'X'.
+          ELSE.
+            CLEAR wa_textpool.
+            READ TABLE it_textpool INTO wa_textpool WITH KEY id = 'S' key = wa_selection-selname.
+            IF wa_textpool-entry(1) = 'D'.
+              wa_textpool-entry(1) = space.
+            ENDIF.
+            CONDENSE wa_textpool-entry.
+            MOVE wa_textpool-entry TO wa_header-key.
+* Setting the flag if key is displayed for the specific selection criteria
+            gc_key_displayed = 'X'.
+          ENDIF.
+        ENDIF.
+        APPEND wa_header TO pt_header.
+        CLEAR wa_header.
+      ENDAT.
+    ENDIF.
+
+* Appending ',' comma after header info, if it is not the last
+* part of selection criteria
+    IF wa_header-info IS NOT INITIAL.
+      IF gc_last_record_flag IS INITIAL.
+        CONCATENATE wa_header-info ',' INTO wa_header-info .
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  if gc_miss_text = 'X'.
+    clear wa_header.
+    wa_header-TYP = 'S'.
+    wa_header-info = '* Too many entries to be displayed on a single line'.
+    append wa_header to pt_header.
+    clear wa_header.
+  endif.
+
+ENDFORM.                    " display
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_GR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_header_info CHANGING p_wa_selection LIKE rsparams
+                               p_info TYPE slis_listheader-info .
+
+* Getting the heade info text as per
+* the options ( Greater that or Equal to or Less than..GT,LT,NE..Etc )
+* for the given selection criteria
+  IF p_wa_selection-high IS INITIAL.
+
+
+    IF p_wa_selection-sign = 'I'.
+      CASE p_wa_selection-option.
+        WHEN 'EQ'.
+          CONCATENATE p_info p_wa_selection-low  INTO p_info.
+        WHEN 'GE'.
+          CONCATENATE p_info '>=' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'LE'.
+          CONCATENATE p_info '<=' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'GT'.
+          CONCATENATE p_info '>' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'LT'.
+          CONCATENATE p_info '<' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'NE'.
+          CONCATENATE p_info 'NE' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+      ENDCASE.
+    ELSEIF p_wa_selection-sign = 'E'.
+      CASE p_wa_selection-option.
+        WHEN 'EQ'.
+          CONCATENATE p_info 'NE' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'GE'.
+          CONCATENATE p_info 'Not >=' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'LE'.
+          CONCATENATE p_info 'Not <=' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'GT'.
+          CONCATENATE p_info 'Not >' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'LT'.
+          CONCATENATE p_info 'Not <' p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+        WHEN 'NE'.
+          CONCATENATE p_info p_wa_selection-low  INTO p_info
+          SEPARATED BY space.
+      ENDCASE.
+    ENDIF.
+  ELSE.
+    IF p_wa_selection-sign = 'I'.
+      CASE p_wa_selection-option.
+        WHEN 'BT'.
+          CONCATENATE p_info p_wa_selection-low ' To ' p_wa_selection-high
+                INTO p_info SEPARATED BY space.
+        WHEN 'NB'.
+          CONCATENATE p_info 'Not from' p_wa_selection-low ' To ' p_wa_selection-high
+                INTO p_info SEPARATED BY space.
+      ENDCASE.
+    ELSEIF p_wa_selection-sign = 'E'.
+      CASE p_wa_selection-option.
+        WHEN 'BT'.
+          CONCATENATE p_info 'Not from' p_wa_selection-low ' To ' p_wa_selection-high
+                INTO p_info SEPARATED BY space.
+        WHEN 'NB'.
+          CONCATENATE p_info p_wa_selection-low ' To ' p_wa_selection-high
+                INTO p_info SEPARATED BY space.
+      ENDCASE.
+    ENDIF.
+  ENDIF.
+
+* Get value of parameter
+  IF p_wa_selection-kind EQ 'P'.
+    IF p_wa_selection-low IS NOT INITIAL.
+      CLEAR p_info.
+      p_info = p_wa_selection-low .
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "CREATE_GR
