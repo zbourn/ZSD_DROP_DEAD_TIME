@@ -1,0 +1,43 @@
+FUNCTION ZTOP_OF_PAGE .
+*"----------------------------------------------------------------------
+*"*"Local interface:
+*"  IMPORTING
+*"     REFERENCE(I_COMPANY) LIKE  T001-BUKRS OPTIONAL
+*"     VALUE(I_TITLE1) LIKE  SY-TITLE
+*"     VALUE(I_RPT_NAME) LIKE  SY-REPID
+*"     VALUE(I_CUSTOM_HEADER) TYPE  SLIS_T_LISTHEADER OPTIONAL
+*"     REFERENCE(I_VARIANT) TYPE  SY-SLSET OPTIONAL
+*"     REFERENCE(I_PAGNO) TYPE  SY-PAGNO OPTIONAL
+*"  TABLES
+*"      IT_HEADER TYPE  SLIS_T_LISTHEADER
+*"----------------------------------------------------------------------
+
+************************************************************************
+* AUTHOR           | Ritika Jhota                                      *
+* CREATION DATE    | 12/23/2010                                        *
+* DESCRIPTION      | Common FM for ALV Top-of-page                     *
+*                  | *Information displayed on top-of-page             *
+*                     Company Name                                     *
+*                     ReportTitle,                                     *
+*                     Report name : abc ,sap system name : PR1         *
+*                     Date/time: 000000/00000                          *
+*                     username :                                       *
+*                     variant Name & detail                            *
+* TRANSPORT        |                                                   *
+************************************************************************
+* Date        : 12/23/2010                                             *
+* Programmer  : Ritika Jhota                                           *
+* Description : Common FM for ALV Top-of-page                          *
+************************************************************************
+*               M O D I F I C A T I O N    L O G                       *
+************************************************************************
+
+* Pass custom text in this table I_CUSTOM_HEADER
+* if not to display selection-option pass typ = 'D' key = field name
+*dont want to display "send Email" check box so pass typ = 'D' and key = 'p_sendem'
+*field name
+*         typ(1) type c,   " H = Header, S = Selection, A = Action D= Delete
+
+PERFORM display TABLES it_header using i_title1 i_rpt_name i_company I_CUSTOM_HEADER i_variant i_pagno.
+
+ENDFUNCTION.
