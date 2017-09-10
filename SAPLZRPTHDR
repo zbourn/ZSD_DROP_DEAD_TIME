@@ -1,0 +1,15 @@
+*******************************************************************
+*   System-defined Include-files.                                 *
+*******************************************************************
+  INCLUDE LZRPTHDRTOP.                       " Global Data
+  INCLUDE LZRPTHDRUXX.                       " Function Modules
+
+*******************************************************************
+*   User-defined Include-files (if necessary).                    *
+*******************************************************************
+* INCLUDE LZHEADERF...                       " Subprograms
+* INCLUDE LZHEADERO...                       " PBO-Modules
+* INCLUDE LZHEADERI...                       " PAI-Modules
+
+INCLUDE LZRPTHDRF01.
+*INCLUDE LZHEADERF01.
