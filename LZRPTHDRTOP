@@ -1,0 +1,5 @@
+FUNCTION-POOL ZRPTHDR.                      "MESSAGE-ID ..
+type-pools: kkblo, slis, vrm, abap,truxs.
+
+*data : it_header TYPE slis_t_listheader,
+*       wa_header TYPE slis_listheader.
